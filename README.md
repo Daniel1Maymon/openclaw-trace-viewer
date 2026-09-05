@@ -128,6 +128,7 @@ All optional, all environment variables:
 | `OPENCLAW_AGENTS_DIR` | `/root/.openclaw/agents` | Where OpenClaw keeps per-agent session data |
 | `TRACE_DB` | `./traces.db` | Index location |
 | `TRACE_SKIP_AGENTS` | *(none)* | Comma-separated agents to exclude from the index |
+| `TRACE_REDACT` | *(off)* | Replace conversation content with placeholders — see below |
 | `TRACE_HOST` | `127.0.0.1` | Bind address — changing this exposes conversation content |
 | `TRACE_PORT` | `8765` | Port |
 
@@ -136,6 +137,30 @@ To index a copy pulled off a server instead of reading it in place:
 ```bash
 OPENCLAW_AGENTS_DIR=./local-copy/agents python3 index_traces.py
 ```
+
+### Redaction mode
+
+For screenshots, demos and screen-shares:
+
+```bash
+TRACE_REDACT=1 python3 serve.py
+```
+
+Every piece of conversation content — user messages, system prompt, thinking
+blocks, tool arguments, tool results, absolute paths — is replaced with
+placeholder text of the same length, line count and indentation. A
+`REDACTED — placeholder content` badge sits in the header so redacted output
+can't be mistaken for real data.
+
+What survives, because it's what the UI exists to show: timings, costs, token
+counts, roles, tool names, `stopReason`, context growth, and the tool-call id
+wiring. Ids are remapped consistently, so a `toolCallId` still visibly pairs
+with the `toolCall` that produced it. Tool results that contain JSON are
+redacted *inside* the JSON, so they still render as JSON.
+
+The index is untouched — redaction happens at read time, so the same
+`traces.db` serves both modes. Note that search still matches against the real
+text, and session ids stay real because the UI uses them to fetch.
 
 ## Trajectory format
 

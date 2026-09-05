@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Read-only trace viewer over OpenClaw trajectory files. Binds to 127.0.0.1 only."""
-import json, os, sqlite3, urllib.parse
+import hashlib, json, os, random, re, sqlite3, urllib.parse
 from datetime import datetime, timezone
 
 def iso_ms(ts):
@@ -64,6 +64,101 @@ def blocks(content):
             out.append({"kind": "text", "text": as_text(b), "path": pre})
     return out
 
+# ---------- redaction (TRACE_REDACT=1) ----------
+# Replaces conversation content with same-shaped placeholder text so the viewer
+# can be screenshotted or demoed without publishing anyone's messages. Timings,
+# costs, token counts, tool names, roles and the call/result id wiring all
+# survive untouched — those are what the UI is actually demonstrating.
+
+REDACT = os.environ.get("TRACE_REDACT", "") not in ("", "0", "false", "no")
+
+# Values kept verbatim: they are structure, not content.
+_KEEP = {"role", "type", "toolName", "name", "api", "provider", "model",
+         "stopReason", "thinkingSignature", "totalOrigin", "kind", "action",
+         "status", "agent", "trigger", "finalStatus", "traceSchema"}
+# Values replaced with a same-shaped fake, so ids still match across a run.
+_IDS = {"id", "toolCallId", "responseId", "traceId", "sessionId", "runId",
+        "listId", "jobId", "transcriptLeafId", "run_id", "session_id"}
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                   r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_WORDS = ("lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod "
+          "tempor incididunt ut labore et dolore magna aliqua enim ad minim veniam "
+          "quis nostrud exercitation ullamco laboris nisi aliquip ex ea commodo "
+          "consequat duis aute irure in reprehenderit voluptate velit esse").split()
+
+def _seed(s):
+    return int(hashlib.md5(s.encode("utf-8")).hexdigest()[:8], 16)
+
+def _fake_id(s):
+    """Same shape, same length, stable — so a toolCallId still visibly pairs
+    with its toolCall, which is half of what the trace view is for."""
+    pre, h, i, out = "", hashlib.md5(s.encode("utf-8")).hexdigest() * 4, 0, []
+    if "_" in s:
+        pre, _, s = s.partition("_")
+        pre += "_"
+    for ch in s:
+        if ch.isalnum():
+            out.append(h[i]); i += 1
+        else:
+            out.append(ch)
+    return pre + "".join(out)
+
+def _fake_text(s):
+    """Placeholder of the same length, line count and indentation, so the
+    character counts shown in the UI stay honest."""
+    if not s.strip():
+        return s
+    rnd = random.Random(_seed(s))
+    lines = []
+    for line in s.split("\n"):
+        if not line.strip():
+            lines.append(line); continue
+        indent = line[:len(line) - len(line.lstrip())]
+        target = max(len(line) - len(indent), 1)
+        words, n = [], 0
+        while n < target:
+            w = rnd.choice(_WORDS); words.append(w); n += len(w) + 1
+        lines.append(indent + " ".join(words)[:target])
+    return "\n".join(lines)
+
+def _fake_string(s):
+    # Keep any embedded uuid recognisable as an id, fake the prose around it.
+    parts, out = _UUID.split(s), []
+    ids = _UUID.findall(s)
+    for i, part in enumerate(parts):
+        out.append(_fake_text(part))
+        if i < len(ids):
+            out.append(_fake_id(ids[i]))
+    return "".join(out)
+
+def scrub(x, key=None):
+    """Walk any decoded JSON and redact content, leaving structure intact."""
+    if not REDACT:
+        return x
+    if isinstance(x, dict):
+        return {k: scrub(v, k) for k, v in x.items()}
+    if isinstance(x, list):
+        return [scrub(v, key) for v in x]
+    if not isinstance(x, str):
+        return x
+    if key in _KEEP:
+        return x
+    if key in _IDS:
+        return _fake_id(x)
+    if key in ("sessionKey", "session_key"):
+        # Only the numeric part identifies a person (a Telegram id); the rest
+        # is routing and worth keeping legible.
+        return re.sub(r"\d{5,}", lambda m: _fake_id(m.group()), x)
+    stripped = x.strip()
+    if stripped[:1] in "{[":
+        # Tool results are usually JSON in a string. Redact inside it so the
+        # rendered result still looks like JSON rather than a wall of lorem.
+        try:
+            return json.dumps(scrub(json.loads(stripped)), ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    return _fake_string(x)
+
 def load_run(path, run_id):
     system_prompt, tools, msgs, meta = "", [], [], {}
     if not os.path.exists(path):
@@ -83,7 +178,7 @@ def load_run(path, run_id):
             continue
         t = e.get("type")
         if t == "context.compiled":
-            system_prompt = d.get("systemPrompt") or ""
+            system_prompt = scrub(d.get("systemPrompt") or "", "systemPrompt")
             for tl in (d.get("tools") or []):
                 if isinstance(tl, dict):
                     tools.append(tl.get("name") or tl.get("function", {}).get("name") or "?")
@@ -92,7 +187,7 @@ def load_run(path, run_id):
             meta["toolCount"] = d.get("toolCount")
             meta["started"] = e.get("ts")
         elif t == "model.completed":
-            msgs = d.get("messagesSnapshot") or []
+            msgs = scrub(d.get("messagesSnapshot") or [])
             meta["usage"] = d.get("usage")
         elif t == "trace.artifacts":
             meta["finalStatus"] = d.get("finalStatus")
@@ -148,6 +243,26 @@ def load_run(path, run_id):
 
 # ---------- HTTP ----------
 
+def hide_path(r):
+    """Absolute paths name the deployment. Sweep every string field, not just
+    file_path — workspace_dir carries one too."""
+    if not REDACT:
+        return r
+    for k, v in list(r.items()):
+        if isinstance(v, str) and v.startswith("/"):
+            r[k] = "<redacted>/" + os.path.basename(v.rstrip("/"))
+    return r
+
+def scrub_row(r):
+    """List rows come from the index, not the trajectory file, so they need
+    their own pass. run_id / session_id stay real — the UI uses them to fetch."""
+    if not REDACT:
+        return r
+    for k in ("user_text", "reply_text", "session_key"):
+        if r.get(k):
+            r[k] = scrub(r[k], k)
+    return r
+
 def query_runs(q):
     con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
     where, args = [], []
@@ -173,7 +288,7 @@ def query_runs(q):
     if grouped:
         # Group into sessions, newest activity first. A session's turns travel
         # with it, so expanding a row needs no second request.
-        rows = [dict(r) for r in con.execute(base + " ORDER BY started_ts", args)]
+        rows = [hide_path(scrub_row(dict(r))) for r in con.execute(base + " ORDER BY started_ts", args)]
         sess = {}
         for r in rows:
             g = sess.setdefault(r["session_id"], {
@@ -197,13 +312,14 @@ def query_runs(q):
         out = sorted(sess.values(), key=lambda x: x["last_ts"] or "", reverse=True)[:limit]
         result = {"rows": out, "grouped": True}
     else:
-        result = {"rows": [dict(r) for r in con.execute(
+        result = {"rows": [hide_path(scrub_row(dict(r))) for r in con.execute(
                       base + " ORDER BY started_ts DESC LIMIT ?", args + [limit])],
                   "grouped": False}
 
     tot = con.execute("SELECT COUNT(*), SUM(ok=0), ROUND(SUM(cost_usd),4), "
                       "COUNT(DISTINCT session_id) FROM runs").fetchone()
-    result.update({"total": tot[0], "failed": tot[1], "cost": tot[2], "sessions": tot[3],
+    result.update({"redact": REDACT,
+                   "total": tot[0], "failed": tot[1], "cost": tot[2], "sessions": tot[3],
                    "agents": [r[0] for r in con.execute(
                        "SELECT DISTINCT agent FROM runs ORDER BY 1")]})
     con.close()
@@ -232,7 +348,7 @@ class H(BaseHTTPRequestHandler):
             if u.path.startswith("/api/session/"):
                 sid = urllib.parse.unquote(u.path[len("/api/session/"):])
                 con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
-                rows = [dict(x) for x in con.execute(
+                rows = [scrub_row(dict(x)) for x in con.execute(
                     "SELECT * FROM runs WHERE session_id = ? ORDER BY started_ts", (sid,))]
                 con.close()
                 if not rows:
@@ -242,6 +358,7 @@ class H(BaseHTTPRequestHandler):
                 shown, truncated = rows[:CAP], max(0, len(rows) - CAP)
                 for r in shown:
                     r["detail"] = load_run(r["file_path"], r["run_id"])
+                    hide_path(r)
                 return self._send(200, json.dumps({
                     "session_id": sid, "agent": rows[0]["agent"],
                     "session_key": rows[0]["session_key"], "model": rows[0]["model"],
@@ -261,6 +378,7 @@ class H(BaseHTTPRequestHandler):
                     return self._send(404, json.dumps({"error": "no such run"}), "application/json")
                 row = dict(row)
                 row["detail"] = load_run(row["file_path"], rid)
+                hide_path(scrub_row(row))
                 return self._send(200, json.dumps(row, ensure_ascii=False), "application/json")
             self._send(404, "not found", "text/plain")
         except Exception as ex:
@@ -281,6 +399,7 @@ main.nodetail{grid-template-columns:1fr}
 main.nodetail>#detail{display:none}
 main.nodetail #list{border-right:none}
 #togdetail{white-space:nowrap}
+.redbadge{background:var(--warn);color:#111;font-weight:700;padding:1px 6px;border-radius:4px;font-size:10px;letter-spacing:.06em}
 #list{overflow:auto;border-right:1px solid var(--line)}
 table{width:100%;border-collapse:collapse}
 th{position:sticky;top:0;background:var(--bg);text-align:left;font-weight:600;font-size:11px;color:var(--dim);padding:6px 8px;border-bottom:1px solid var(--line);text-transform:uppercase;letter-spacing:.04em}
@@ -421,7 +540,8 @@ async function load(){
     $("#agent").innerHTML='<option value="">all agents</option>'+d.agents.map(a=>`<option>${a}</option>`).join("");
     $("#agent").dataset.done=1;
   }
-  $("#stats").textContent=`${d.total} runs in ${d.sessions} sessions · ${d.failed} failed · $${d.cost} total · showing ${d.rows.length}`;
+  $("#stats").innerHTML=(d.redact?`<span class=redbadge>REDACTED — placeholder content</span> `:"")
+    +esc(`${d.total} runs in ${d.sessions} sessions · ${d.failed} failed · $${d.cost} total · showing ${d.rows.length}`);
 
   const head=d.grouped
     ? `<tr><th></th><th>last activity</th><th>agent</th><th>session</th><th>first message</th><th>turns</th><th>total</th><th>tools</th><th>cost</th></tr>`
