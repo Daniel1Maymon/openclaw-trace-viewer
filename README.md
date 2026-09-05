@@ -90,6 +90,27 @@ isn't an optimisation, it's a requirement.
 file when you open one. It is a single file with no dependencies beyond the
 Python standard library.
 
+### What happens when you click a row
+
+1. The browser asks for `/api/run/<run_id>`.
+2. `serve.py` looks that run up in the index — one row, which includes the
+   path of the trajectory file it came from.
+3. It opens that file and reads only the lines belonging to that run, ignoring
+   the rest. A 10 MB file with forty runs in it costs one pass, not forty.
+4. From those lines it rebuilds the run: the system prompt and tool list out of
+   `context.compiled`, the conversation out of `model.completed`, timing and
+   final status out of `session.started` / `session.ended`.
+5. It splits the conversation at each assistant message. Everything before one
+   is the context that went *into* that model call; the message itself is the
+   call's output; the tool results that follow are what came back.
+6. The browser renders that as alternating context and call blocks.
+
+The index holds only what a list row needs: metrics, status, tool names, plus
+the first user message and last assistant reply for the preview column and the
+search box. Everything else you read in the detail pane comes straight off disk
+at the moment you ask for it — which is why redaction can be a runtime switch
+rather than a rebuild, and why `traces.db` still counts as sensitive.
+
 ### One correctness detail worth knowing
 
 `model.completed.messagesSnapshot` is **cumulative** — it holds the entire
@@ -191,16 +212,71 @@ The envelope on every line carries `traceId`, `sessionId`, `sessionKey`,
 `runId`, `provider`, `modelId`, `seq` and `ts`. Verified uniform across the
 reference corpus: `schemaVersion: 1` on every line, zero parse errors.
 
-## Privacy
+## Security model
 
-The trajectory files contain complete conversation content — user messages,
-system prompts, tool arguments and tool results. So does the index built from
-them.
+The data this reads is as sensitive as it gets: complete conversation content,
+system prompts, tool arguments and tool results, for every session on disk. The
+design follows from that.
 
-- `traces.db` is in `.gitignore` and must stay there.
-- `serve.py` binds to loopback and has no authentication. Do not change
-  `TRACE_HOST` and put it on a public interface.
-- Use an SSH tunnel for remote access.
+### It only listens to itself
+
+`serve.py` binds to `127.0.0.1`. That address means *this machine only* — the
+server accepts a connection from a program running on the same box, and from
+nothing else. The machine can have a public IP, sit on the open internet, and
+port 8765 is still unreachable from outside. Not firewalled off, not blocked
+after the fact: the listening socket was never offered to the network.
+
+So you reach it by tunnelling, which forwards a port on your laptop to a port
+on the server through your existing SSH connection:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 user@your-server 'cd ~/trace-viewer && python3 serve.py'
+```
+
+The traffic rides inside SSH. Nothing new is exposed.
+
+### The SSH key is the authentication
+
+The viewer has no login screen, and that is deliberate rather than unfinished.
+Authentication protects a door that strangers can knock on; this door only
+opens from inside the machine. To get inside you need SSH, and SSH already
+proved who you are with your key. Adding a password on top would guard a
+hallway that is already behind a locked front door.
+
+The consequence, stated plainly: **anyone who can already log into that server
+can read every conversation.** That is the same access they had before this
+tool existed — the trajectory files were always readable to them — but the
+viewer makes it convenient. If that matters for your deployment, run the viewer
+on a copy of the files elsewhere instead.
+
+### Nothing leaves the machine
+
+- **No outbound network calls.** The viewer talks to no API and no service.
+- **No external resources in the page.** No CDN, no web fonts, no analytics,
+  no third-party JavaScript. The HTML, CSS and JS are one self-contained file,
+  so nothing is fetched from anyone and nobody learns you opened it.
+- **No dependencies.** Python standard library only, so there is no package
+  supply chain to trust.
+
+### It never writes to the agent runtime
+
+`index_traces.py` opens trajectory files for reading and writes exactly one
+thing: `traces.db`, next to the script. `serve.py` writes nothing at all. No
+config is edited, no gateway restarted, no plugin installed. Deleting the two
+scripts and the database leaves the deployment exactly as it was.
+
+### Keep the index out of git
+
+`traces.db` holds real conversation text. It is in `.gitignore`, and that line
+should stay there. If you publish the repository, use `TRACE_REDACT=1` for any
+screenshot rather than cropping a real one — cropping hides a region, redaction
+removes the content.
+
+### What this does not protect against
+
+Someone with a shell on the server, a stolen SSH key, or physical access to
+the disk. None of those are made worse by this tool, and none are made better
+by it. It is a reader, not a boundary.
 
 ## Status
 
