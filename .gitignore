@@ -1,0 +1,9 @@
+# The index is derived data — rebuild it with index_traces.py.
+# It also contains real conversation content, so it must never be committed.
+traces.db
+traces.db-journal
+*.sqlite
+
+__pycache__/
+*.pyc
+.DS_Store
