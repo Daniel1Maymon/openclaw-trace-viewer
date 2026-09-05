@@ -1,8 +1,10 @@
 # The index is derived data — rebuild it with index_traces.py.
 # It also contains real conversation content, so it must never be committed.
+# WAL mode adds -wal and -shm alongside the db; -wal holds real rows too.
 traces.db
-traces.db-journal
+traces.db-*
 *.sqlite
+*.sqlite-*
 
 __pycache__/
 *.pyc
