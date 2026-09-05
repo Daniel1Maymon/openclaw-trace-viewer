@@ -277,6 +277,10 @@ input,select,button{font:inherit;padding:4px 8px;border:1px solid var(--line);bo
 button{cursor:pointer}
 .stat{color:var(--dim);font-size:12px}
 main{display:grid;grid-template-columns:minmax(420px,1fr) 1.3fr;height:calc(100vh - 47px)}
+main.nodetail{grid-template-columns:1fr}
+main.nodetail>#detail{display:none}
+main.nodetail #list{border-right:none}
+#togdetail{white-space:nowrap}
 #list{overflow:auto;border-right:1px solid var(--line)}
 table{width:100%;border-collapse:collapse}
 th{position:sticky;top:0;background:var(--bg);text-align:left;font-weight:600;font-size:11px;color:var(--dim);padding:6px 8px;border-bottom:1px solid var(--line);text-transform:uppercase;letter-spacing:.04em}
@@ -355,6 +359,7 @@ td.sess{cursor:pointer;font-size:11px}td.sess:hover{color:var(--accent);text-dec
     <option value=500>500</option><option value=2000 selected>2,000</option>
     <option value=10000>10,000</option><option value=0>all</option>
   </select> chars</label>
+  <button id=togdetail title="collapse the trace pane so the list gets the full width (\ toggles)">hide trace</button>
   <span class=stat id=stats></span>
 </header>
 <main>
@@ -363,6 +368,15 @@ td.sess{cursor:pointer;font-size:11px}td.sess:hover{color:var(--accent);text-dec
 </main>
 <script>
 const $=s=>document.querySelector(s);
+
+// Collapse the trace pane. Persisted, because whoever wants the wide list
+// usually wants it on the next page load too.
+function setDetail(hidden){
+  document.querySelector("main").classList.toggle("nodetail",hidden);
+  $("#togdetail").textContent=hidden?"show trace":"hide trace";
+  try{localStorage.setItem("hideDetail",hidden?"1":"")}catch(e){}
+}
+function detailHidden(){return document.querySelector("main").classList.contains("nodetail")}
 const esc=s=>(s??"").toString().replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const dur=ms=>ms==null?"—":ms<1000?ms+"ms":ms<60000?(ms/1000).toFixed(1)+"s":Math.floor(ms/60000)+"m"+Math.round(ms%60000/1000)+"s";
 const when=t=>t?t.replace("T"," ").replace(/\..*/,""):"—";
@@ -548,6 +562,7 @@ const hdr=(r,extra)=>`<div class=lbl style="margin-bottom:8px;flex-wrap:wrap">
   </div>`;
 
 async function open(tr){
+  if(detailHidden())setDetail(false);
   if(sel)sel.classList.remove("sel");
   sel=tr;tr.classList.add("sel");
   FULL=[];
@@ -565,6 +580,7 @@ async function open(tr){
 }
 
 async function openSession(sid){
+  if(detailHidden())setDetail(false);
   FULL=[];
   $("#detail").innerHTML="<div class=empty>loading whole session…</div>";
   const s=await (await fetch("/api/session/"+encodeURIComponent(sid))).json();
@@ -592,6 +608,17 @@ $("#lim").onchange=()=>{LIMIT=+$("#lim").value;if(sel)open(sel)};
 $("#mode").onchange=()=>{MODE=$("#mode").value;if(sel)open(sel)};
 $("#grp").onchange=load;
 let t;$("#q").oninput=()=>{clearTimeout(t);t=setTimeout(load,250)};
+
+$("#togdetail").onclick=()=>setDetail(!detailHidden());
+// Backslash toggles it, as long as you are not typing in the search box.
+document.addEventListener("keydown",e=>{
+  if(e.key!=="\\"||e.metaKey||e.ctrlKey||e.altKey)return;
+  const t=e.target.tagName;
+  if(t==="INPUT"||t==="SELECT"||t==="TEXTAREA")return;
+  e.preventDefault(); setDetail(!detailHidden());
+});
+try{if(localStorage.getItem("hideDetail"))setDetail(true)}catch(e){}
+
 load();
 </script>"""
 
