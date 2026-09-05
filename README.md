@@ -8,6 +8,17 @@ It reads the `*.trajectory.jsonl` files OpenClaw already writes to disk. No
 plugin, no config change, no gateway restart, no telemetry backend. Nothing is
 written to the agent runtime.
 
+![Session list](docs/session-list.png)
+
+*Every run on disk, grouped by session. Expand a row to see its turns, with
+per-turn duration, tool count, failed tool calls and cost.*
+
+![Trace detail](docs/trace-detail.png)
+
+*Inside a turn: the complete context going into each model call, then the call
+itself — thinking, output, tool calls and results — with the JSON key path for
+every rendered value.*
+
 ---
 
 ## Why
