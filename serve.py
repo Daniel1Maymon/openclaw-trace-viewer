@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Read-only trace viewer over OpenClaw trajectory files. Binds to 127.0.0.1 only."""
-import hashlib, json, os, random, re, sqlite3, urllib.parse
+import hashlib, json, os, random, re, sqlite3, sys, threading, time, urllib.parse
 from datetime import datetime, timezone
 
 def iso_ms(ts):
@@ -19,6 +19,66 @@ DB = os.environ.get("TRACE_DB", os.path.join(HERE, "traces.db"))
 # Loopback only, on purpose: reach it over an SSH tunnel, never expose it.
 HOST = os.environ.get("TRACE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TRACE_PORT", "8765"))
+# Seconds between "did anything change?" checks. 0 turns the timer off and
+# leaves only the refresh button.
+REFRESH_SEC = int(os.environ.get("TRACE_REFRESH_SEC", "30"))
+
+sys.path.insert(0, HERE)
+try:
+    import index_traces as indexer
+except Exception as _ex:          # the viewer still serves the existing index
+    indexer, _import_error = None, str(_ex)
+
+def db():
+    """Reader connection. busy_timeout so a page load waits out a concurrent
+    index write instead of failing with 'database is locked'."""
+    con = sqlite3.connect(DB, timeout=10)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout=10000")
+    return con
+
+# ---------- keeping the index fresh ----------
+# A trajectory file is only written when a run *finishes* — OpenClaw holds every
+# event of a run in memory and rewrites the whole file during cleanup. So there
+# is nothing to see between runs, and a timer misses nothing that an OS-level
+# file watcher would catch. Checking timestamp+size for ~1,100 files costs about
+# 10ms, which is what makes a 30s poll the boring right answer.
+#
+# DATA_VERSION is not a count of anything. It is a label the page compares
+# against its own copy to decide whether it needs to re-fetch the list.
+DATA_VERSION = 0
+SWEEP = {"checked": None, "running": False, "error": None,
+         "last_files": 0, "last_runs": 0}
+_sweep_lock = threading.Lock()
+
+def run_sweep():
+    """One incremental index pass. Bumps DATA_VERSION only if a file moved."""
+    global DATA_VERSION
+    if indexer is None:
+        SWEEP["error"] = f"indexer unavailable: {_import_error}"
+        return 0
+    with _sweep_lock:
+        SWEEP["running"] = True
+        try:
+            con = indexer.connect(DB)
+            con.executescript(indexer.SCHEMA)
+            changed, rows, errs = indexer.sweep(con)
+            con.close()
+            SWEEP.update({"error": None, "last_files": changed, "last_runs": rows})
+            if changed:
+                DATA_VERSION += 1
+            return changed
+        except Exception as ex:
+            SWEEP["error"] = str(ex)
+            return 0
+        finally:
+            SWEEP["running"] = False
+            SWEEP["checked"] = datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+def refresh_loop():
+    while True:
+        time.sleep(REFRESH_SEC)
+        run_sweep()
 
 # ---------- detail: re-parse one run out of its trajectory file ----------
 
@@ -264,7 +324,7 @@ def scrub_row(r):
     return r
 
 def query_runs(q):
-    con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
+    con = db()
     where, args = [], []
     if q.get("agent"):
         where.append("agent = ?"); args.append(q["agent"][0])
@@ -337,17 +397,36 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _version(self):
+        return {"v": DATA_VERSION, "every": REFRESH_SEC, "checked": SWEEP["checked"],
+                "running": SWEEP["running"], "error": SWEEP["error"],
+                "last_files": SWEEP["last_files"], "last_runs": SWEEP["last_runs"]}
+
+    def do_POST(self):
+        u = urllib.parse.urlparse(self.path)
+        try:
+            if u.path == "/api/reindex":
+                run_sweep()          # on demand; the timer keeps running too
+                return self._send(200, json.dumps(self._version()), "application/json")
+            self._send(404, "not found", "text/plain")
+        except Exception as ex:
+            self._send(500, json.dumps({"error": str(ex)}), "application/json")
+
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
         try:
             if u.path == "/":
                 return self._send(200, PAGE, "text/html; charset=utf-8")
+            if u.path == "/api/version":
+                # ~60 bytes. The page asks this every few seconds and only
+                # re-fetches the run list when the value differs from its own.
+                return self._send(200, json.dumps(self._version()), "application/json")
             if u.path == "/api/runs":
                 return self._send(200, json.dumps(query_runs(q)), "application/json")
             if u.path.startswith("/api/session/"):
                 sid = urllib.parse.unquote(u.path[len("/api/session/"):])
-                con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
+                con = db()
                 rows = [scrub_row(dict(x)) for x in con.execute(
                     "SELECT * FROM runs WHERE session_id = ? ORDER BY started_ts", (sid,))]
                 con.close()
@@ -371,7 +450,7 @@ class H(BaseHTTPRequestHandler):
                 }, ensure_ascii=False), "application/json")
             if u.path.startswith("/api/run/"):
                 rid = urllib.parse.unquote(u.path[len("/api/run/"):])
-                con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
+                con = db()
                 row = con.execute("SELECT * FROM runs WHERE run_id = ?", (rid,)).fetchone()
                 con.close()
                 if not row:
@@ -462,6 +541,8 @@ td.sess{cursor:pointer;font-size:11px}td.sess:hover{color:var(--accent);text-dec
 .rolechip{display:inline-block;font-size:10px;background:var(--card);border:1px solid var(--line);border-radius:9px;padding:0 6px;margin-bottom:2px;font-family:ui-monospace,Menlo,monospace}
 .call{border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;padding:10px;margin:0 0 16px}
 .pill{display:inline-block;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:1px 7px;font-size:11px;margin-right:4px}
+.newpill{background:var(--warn);color:#1a1a1a;border-color:var(--warn);font-weight:700}
+#fresh{font-variant-numeric:tabular-nums}
 </style>
 <header>
   <h1>OpenClaw Traces</h1>
@@ -479,7 +560,10 @@ td.sess{cursor:pointer;font-size:11px}td.sess:hover{color:var(--accent);text-dec
     <option value=10000>10,000</option><option value=0>all</option>
   </select> chars</label>
   <button id=togdetail title="collapse the trace pane so the list gets the full width (\ toggles)">hide trace</button>
+  <button id=refresh title="check for new runs right now">refresh</button>
+  <button id=newpill class=newpill hidden>▲ new runs — click to load</button>
   <span class=stat id=stats></span>
+  <span class=stat id=fresh></span>
 </header>
 <main>
   <div id=list></div>
@@ -737,6 +821,54 @@ document.addEventListener("keydown",e=>{
   if(t==="INPUT"||t==="SELECT"||t==="TEXTAREA")return;
   e.preventDefault(); setDetail(!detailHidden());
 });
+// ---------- staying up to date ----------
+// The server re-checks the trajectory files on a timer and gives its data a new
+// version label whenever one of them moved. We hold onto the last label we saw
+// and ask for it every few seconds; 60 bytes, no work, until it differs.
+//
+// Differs, not "is bigger": the label lives in the server's memory, so a restart
+// sends it back to 0. Comparing for "bigger" would leave the page stale forever.
+let DV=null;
+
+async function reloadKeepingPlace(){
+  const el=$("#list"), top=el.scrollTop;
+  await load();
+  el.scrollTop=top;              // never move what someone is reading
+}
+
+function showFresh(v){
+  if(!v.checked){$("#fresh").textContent="";return}
+  $("#fresh").textContent=v.error?("refresh failing: "+v.error)
+    :(v.running?"checking…":"checked "+v.checked+" UTC");
+}
+
+async function checkVersion(){
+  let v;
+  try{v=await (await fetch("/api/version")).json()}catch(e){return}
+  showFresh(v);
+  if(DV===null){DV=v.v;return}
+  if(v.v===DV)return;
+  DV=v.v;
+  // A trace is open — someone is reading. Offer the update, don't impose it.
+  if(sel){$("#newpill").hidden=false}
+  else await reloadKeepingPlace();
+}
+
+$("#newpill").onclick=async()=>{$("#newpill").hidden=true;await reloadKeepingPlace()};
+
+$("#refresh").onclick=async()=>{
+  const b=$("#refresh"); b.disabled=true; b.textContent="checking…";
+  try{
+    const v=await (await fetch("/api/reindex",{method:"POST"})).json();
+    DV=v.v; showFresh(v); $("#newpill").hidden=true;
+    await reloadKeepingPlace();
+  }catch(e){}
+  b.disabled=false; b.textContent="refresh";
+};
+
+setInterval(checkVersion,5000);
+checkVersion();
+
 try{if(localStorage.getItem("hideDetail"))setDetail(true)}catch(e){}
 
 load();
@@ -789,6 +921,13 @@ if __name__ == "__main__":
                 continue
             raise
     print(f"trace viewer on http://{HOST}:{PORT}  (db: {DB})", flush=True)
+    if indexer is None:
+        print(f"auto-refresh OFF — {_import_error}", flush=True)
+    elif REFRESH_SEC > 0:
+        print(f"auto-refresh every {REFRESH_SEC}s (TRACE_REFRESH_SEC=0 to disable)", flush=True)
+        threading.Thread(target=refresh_loop, daemon=True).start()
+    else:
+        print("auto-refresh off; use the refresh button", flush=True)
     print("stop with Ctrl+C", flush=True)
     try:
         srv.serve_forever()

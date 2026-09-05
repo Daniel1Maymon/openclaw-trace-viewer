@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Build a SQLite index over OpenClaw trajectory files. Read-only on the source."""
+"""Build a SQLite index over OpenClaw trajectory files. Read-only on the source.
+
+The index is a growing archive, never a mirror. A trajectory file is a rolling
+10 MB window: OpenClaw rewrites the whole file at the end of every run and drops
+the oldest lines to stay under the cap (`trimJsonlWindow` in its source). So a
+run that has aged out of its file exists nowhere but here. Two rules follow, and
+both are load-bearing:
+
+  * never DROP the runs table and rebuild — that would delete trimmed-away runs
+    from the only copy that still has them;
+  * never let a re-read downgrade a complete row to an empty one, which is what
+    a half-trimmed run parses as (see the WHERE clause in `upsert_sql`).
+"""
 import json, glob, os, sqlite3, sys, time
 from datetime import datetime, timezone
 
@@ -21,8 +33,7 @@ DB = os.environ.get("TRACE_DB",
 SKIP_AGENTS = {a for a in os.environ.get("TRACE_SKIP_AGENTS", "").split(",") if a}
 
 SCHEMA = """
-DROP TABLE IF EXISTS runs;
-CREATE TABLE runs (
+CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY, session_id TEXT, agent TEXT, session_key TEXT,
   provider TEXT, model TEXT, trigger TEXT, workspace_dir TEXT,
   started_ts TEXT, ended_ts TEXT, duration_ms INTEGER,
@@ -34,10 +45,29 @@ CREATE TABLE runs (
   user_text TEXT, reply_text TEXT,
   file_path TEXT, has_transcript INTEGER
 );
-CREATE INDEX idx_started ON runs(started_ts DESC);
-CREATE INDEX idx_agent ON runs(agent);
-CREATE INDEX idx_ok ON runs(ok);
+CREATE INDEX IF NOT EXISTS idx_started ON runs(started_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_agent ON runs(agent);
+CREATE INDEX IF NOT EXISTS idx_ok ON runs(ok);
+
+-- What each trajectory file looked like the last time we read it. A file whose
+-- timestamp and size both match is untouched and gets skipped: that check is
+-- what makes a refresh cost milliseconds instead of seconds.
+CREATE TABLE IF NOT EXISTS seen (
+  path TEXT PRIMARY KEY, mtime REAL, size INTEGER
+);
 """
+
+
+def connect(db=None):
+    """A connection safe to use while another thread is writing.
+
+    WAL lets the viewer keep serving pages during a re-index instead of erroring
+    with 'database is locked'; busy_timeout makes the rare genuine collision wait
+    rather than fail."""
+    con = sqlite3.connect(db or DB, timeout=10)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=10000")
+    return con
 
 def num(x):
     return x if isinstance(x, (int, float)) and not isinstance(x, bool) else 0
@@ -195,21 +225,51 @@ def parse_file(path, agent, has_transcript):
         out.append(r)
     return out
 
-def main():
-    t0 = time.time()
-    con = sqlite3.connect(DB)
-    con.executescript(SCHEMA)
-    cols = [c[1] for c in con.execute("PRAGMA table_info(runs)")]
-    ins = f"INSERT OR REPLACE INTO runs ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})"
-
-    files, n_rows, n_files, errs = [], 0, 0, 0
+def list_files():
+    """Every trajectory file worth indexing, as (path, agent)."""
+    out = []
     for adir in sorted(glob.glob(os.path.join(AGENTS_DIR, "*"))):
         agent = os.path.basename(adir)
         if agent in SKIP_AGENTS:
             continue
-        files += [(p, agent) for p in sorted(glob.glob(os.path.join(adir, "sessions", "*.trajectory.jsonl")))]
+        out += [(p, agent) for p in
+                sorted(glob.glob(os.path.join(adir, "sessions", "*.trajectory.jsonl")))]
+    return out
+
+def upsert_sql(cols):
+    """Add or update a run, but never blank out one we already have in full.
+
+    A file that has been trimmed can hand us a run whose `session.started` and
+    `model.completed` lines are gone; that parses as a row with no messages and
+    no tokens. Without the WHERE, re-reading such a file would overwrite the
+    good stored row with the stub."""
+    setters = ", ".join(f"{c}=excluded.{c}" for c in cols if c != "run_id")
+    return (f"INSERT INTO runs ({','.join(cols)}) VALUES ({','.join('?' * len(cols))}) "
+            f"ON CONFLICT(run_id) DO UPDATE SET {setters} "
+            f"WHERE excluded.msg_count > 0 OR excluded.total_tokens > 0 "
+            f"   OR (runs.msg_count = 0 AND runs.total_tokens = 0)")
+
+def sweep(con, verbose=False):
+    """One incremental pass. Returns (files_reread, rows_written, errors).
+
+    Reads the timestamp and size of every trajectory file — about 10ms for a
+    thousand of them — and opens only the ones that moved. A run is only written
+    to disk when it finishes, so a file whose stats changed means exactly one
+    thing: a turn completed in that session."""
+    cols = [c[1] for c in con.execute("PRAGMA table_info(runs)")]
+    sql = upsert_sql(cols)
+    seen = {p: (m, s) for p, m, s in con.execute("SELECT path, mtime, size FROM seen")}
+    files = list_files()
+    changed, n_rows, errs = 0, 0, 0
 
     for path, agent in files:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        prev = seen.get(path)
+        if prev and prev[0] == st.st_mtime and prev[1] == st.st_size:
+            continue
         base = path[: -len(".trajectory.jsonl")]
         has_tr = 1 if os.path.exists(base + ".jsonl") else 0
         try:
@@ -218,17 +278,32 @@ def main():
             errs += 1
             print(f"  ERROR {path}: {ex}", file=sys.stderr)
             continue
-        n_files += 1
         for r in rows:
-            con.execute(ins, [r.get(c) for c in cols])
+            con.execute(sql, [r.get(c) for c in cols])
             n_rows += 1
-        if n_files % 200 == 0:
+        con.execute("INSERT INTO seen (path, mtime, size) VALUES (?,?,?) "
+                    "ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size",
+                    (path, st.st_mtime, st.st_size))
+        changed += 1
+        if verbose and changed % 200 == 0:
             con.commit()
-            print(f"  ... {n_files}/{len(files)} files, {n_rows} runs", flush=True)
-    con.commit()
+            print(f"  ... {changed} files re-read, {n_rows} runs", flush=True)
 
-    print(f"\nindexed {n_files} files -> {n_rows} runs in {time.time()-t0:.1f}s ({errs} file errors)")
-    for row in con.execute("SELECT agent, COUNT(*), SUM(ok=0), ROUND(SUM(cost_usd),4) FROM runs GROUP BY agent"):
+    con.commit()
+    return changed, n_rows, errs
+
+def main():
+    t0 = time.time()
+    con = connect()
+    con.executescript(SCHEMA)
+    changed, n_rows, errs = sweep(con, verbose=True)
+    held = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+
+    print(f"\nre-read {changed} changed files -> {n_rows} runs written "
+          f"in {time.time()-t0:.1f}s ({errs} file errors)")
+    print(f"index holds {held} runs")
+    for row in con.execute("SELECT agent, COUNT(*), SUM(ok=0), ROUND(SUM(cost_usd),4) "
+                           "FROM runs GROUP BY agent"):
         print(f"  {row[0]:<12} runs={row[1]:<5} failed={row[2]:<5} cost=${row[3]}")
     con.close()
 
