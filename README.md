@@ -19,6 +19,10 @@ per-turn duration, tool count, failed tool calls and cost.*
 itself — thinking, output, tool calls and results — with the JSON key path for
 every rendered value.*
 
+Both screenshots are real runs from a live deployment, deliberately — the point
+of the tool is what real traffic looks like. One Telegram user id is blacked
+out; nothing else is altered.
+
 ---
 
 ## Why
@@ -268,9 +272,15 @@ scripts and the database leaves the deployment exactly as it was.
 ### Keep the index out of git
 
 `traces.db` holds real conversation text. It is in `.gitignore`, and that line
-should stay there. If you publish the repository, use `TRACE_REDACT=1` for any
-screenshot rather than cropping a real one — cropping hides a region, redaction
-removes the content.
+should stay there.
+
+For screenshots you have two options, and they are for different jobs. Publish
+a real capture when the content is yours and mundane, and black out the few
+identifiers that are not — that is what the images above do, and it shows what
+real traffic actually looks like. Use `TRACE_REDACT=1` when the content is not
+yours to publish, or when there is too much of it to check by eye. A black
+rectangle is only as good as your review of the rest of the frame; redaction
+does not depend on you spotting anything.
 
 ### What this does not protect against
 
