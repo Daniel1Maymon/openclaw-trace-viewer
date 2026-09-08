@@ -895,7 +895,7 @@ function callBlock(M,C,c,n,fold){
       ${m.usage?`<span class="pill mono">${esc(tok(m.usage))}</span>`:''}
       ${results.length?`<span class=dim>${results.length} tool result${results.length>1?"s":""}</span>`:''}</div></summary>
     <details class=outsec${fold?"":" open"}><summary class=cardsum><span class=lbl>
-      <span class=actor>the model said</span>
+      <span class=actor>model output</span>
       <span class=saidwhat>${asked.length?`→ use ${asked.map(esc).join(", ")}`:"final answer · no tool"}</span></span></summary>${out}</details>
     ${results.map(t=>`<details class="sub tool ${t.isError?'err':''}"${fold?"":" open"}>
       <summary class=cardsum><span class=lbl>
