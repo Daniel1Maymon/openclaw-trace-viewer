@@ -548,6 +548,11 @@ details>summary{cursor:pointer;color:var(--accent);font-size:12px;padding:3px 0}
 .call.prior{opacity:.55}
 .callhead{font-weight:600;font-size:13px;margin-bottom:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .outlbl{font-size:10px;letter-spacing:.08em;color:var(--dim);margin:8px 0 3px;text-transform:uppercase}
+/* Where "new" starts. Without it the shaded rows merge into one band and you
+   cannot see which message the boundary falls on. */
+.newedge{display:flex;align-items:center;gap:8px;margin:12px 0 6px}
+.newedge::before,.newedge::after{content:"";flex:1;height:1px;background:var(--warn);opacity:.4}
+.newedge>span{color:var(--warn);font-size:10px;letter-spacing:.08em;text-transform:uppercase;white-space:nowrap;font-weight:600}
 /* Two outputs from two producers, one after the other: the model's, then the
    tool's. Identical treatment and the same indent, so they read as the matched
    pair they are — see the flush rule below .sub. */
@@ -851,22 +856,37 @@ function msgBody(m){
 // The full conversation as it stands going into a call — every message, with
 // the ones added since the previous call marked and open by default.
 function contextBlock(M,SP,c,prev,n,final,fold){
-  const ctx=M.slice(0,c.i), from=prev==null?0:prev.i;
+  const ctx=M.slice(0,c.i);
+  // A call's own assistant message is genuinely new relative to that call's
+  // *input*, which is why the boundary is normally the previous call's index.
+  // Across a turn boundary it is not: the previous turn's FINAL CONTEXT card has
+  // already shown that message and already marked it new. Starting at prev.i
+  // there marked the same message new twice in a row, in two adjacent cards.
+  const from=prev==null?0:(prev.prior?prev.i+1:prev.i);
   const added=ctx.length-from;
+  // "model call #0" does not exist. When prev belongs to an earlier turn its
+  // number means nothing here, so the boundary is named by the turn instead.
+  const since=prev==null?"the run started"
+    :prev.prior?"the previous turn"
+    :"model call #"+(final?n:n-1);
   // The counts live inside the summary so a folded card still says what it holds.
   return `<details class=ctx${fold?"":" open"}>
     <summary class=cardsum>
       <div class="ctxhead${final?' fin':''}">${final?`FINAL CONTEXT · after model call #${n}`:`CONTEXT → MODEL CALL #${n}`}</div>
       <div class=ctxsum>${ctx.length} message${ctx.length===1?"":"s"} · ${size(ctx).toLocaleString()} chars
         · system prompt ${SP.length.toLocaleString()} chars
-        ${added>0?`· <span class=grow>${added} new since ${prev==null?"the run started":"model call #"+(final?n:n-1)}</span>`:""}</div>
+        ${added>0?`· <span class=grow>${added} new since ${since}</span>`:""}</div>
     </summary>
     <details class=spwrap><summary>system prompt (${SP.length.toLocaleString()} chars)</summary>${cut(SP)}</details>
     ${ctx.map((m,i)=>{
       const isNew=i>=from;
+      // The shading alone ran the new messages together into one indistinct
+      // band with no visible start. This is the line it starts at.
+      const edge=(isNew&&i===from&&from>0&&added>0)
+        ?`<div class=newedge><span>${added} new since ${since}</span></div>`:"";
       // Messages carried over from an earlier call start folded; the ones added
       // since start open. Either way the handle is the same.
-      return `<details class="ctxmsg${isNew?" new":""}"${isNew&&!fold?" open":""}>
+      return edge+`<details class="ctxmsg${isNew?" new":""}"${isNew&&!fold?" open":""}>
         <summary class=cardsum><div class=ctxmsghead><span class=rolechip>#${i+1} ${esc(mlabel(m))}</span>
           ${isNew?'<span class=newbadge>new</span>':''}
           <span class=dim>${mchars(m).toLocaleString()} chars</span></div></summary>
