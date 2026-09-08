@@ -649,12 +649,34 @@ const esc=s=>(s??"").toString().replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>'
 const dur=ms=>ms==null?"—":ms<1000?ms+"ms":ms<60000?(ms/1000).toFixed(1)+"s":Math.floor(ms/60000)+"m"+Math.round(ms%60000/1000)+"s";
 const when=t=>t?t.replace("T"," ").replace(/\..*/,""):"—";
 let FULL=[], LIMIT=2000, MODE="readable";
+// The agent filter is held here rather than read off the <select>, because the
+// dropdown's options only exist after the first response — a restored filter has
+// to be applied to that first request, before there is an option to select.
+let AGENT="";
 
 // What is open in the trace pane, kept as ids rather than as an element. The
 // list is rebuilt from scratch on every refresh, so an element reference goes
 // stale and the highlight vanishes while the trace beside it is still open.
 // One of these two is set, never both.
 let SELID=null, SELSESS=null;
+
+// ---------- remembering where you were ----------
+// Traces and Reliability are separate URLs, so switching between them is a full
+// page load: filters, the open trace and the scroll position would all come back
+// empty. Everything needed to restore the view is small, so it is written on
+// every change and re-applied on the next load. Per-browser by design — this is
+// a convenience, not data, and localStorage can legitimately come back empty.
+const STATE="traceState";
+function saveState(){
+  try{localStorage.setItem(STATE,JSON.stringify({
+    agent:AGENT, failed:$("#failed").checked, q:$("#q").value,
+    grp:$("#grp").value, mode:MODE, lim:$("#lim").value,
+    selid:SELID, selsess:SELSESS, scroll:$("#list").scrollTop}))}catch(e){}
+}
+function readState(){
+  try{return JSON.parse(localStorage.getItem(STATE)||"{}")||{}}catch(e){return{}}
+}
+const S0=readState();
 
 // Re-apply the highlight to whatever row now represents the open trace. Safe to
 // call when nothing matches — a run can be open that the current filter or limit
@@ -697,7 +719,7 @@ const J=o=>JSON.stringify(o,null,2);
 
 async function load(){
   const p=new URLSearchParams();
-  if($("#agent").value)p.set("agent",$("#agent").value);
+  if(AGENT)p.set("agent",AGENT);
   if($("#failed").checked)p.set("failed","1");
   if($("#q").value.trim())p.set("q",$("#q").value.trim());
   p.set("group",$("#grp").value);
@@ -705,6 +727,7 @@ async function load(){
   if(!$("#agent").dataset.done){
     $("#agent").innerHTML='<option value="">all agents</option>'+d.agents.map(a=>`<option>${a}</option>`).join("");
     $("#agent").dataset.done=1;
+    $("#agent").value=AGENT;   // the restored filter finally has an option to point at
   }
   $("#stats").innerHTML=(d.redact?`<span class=redbadge>REDACTED — placeholder content</span> `:"")
     +esc(`${d.total} runs in ${d.sessions} sessions · ${d.failed} failed · $${d.cost} total · showing ${d.rows.length}`);
@@ -854,7 +877,7 @@ const hdr=(r,extra)=>`<div class=lbl style="margin-bottom:8px;flex-wrap:wrap">
 
 async function open(tr){
   if(detailHidden())setDetail(false);
-  SELID=tr.dataset.id; SELSESS=null; markSel();
+  SELID=tr.dataset.id; SELSESS=null; markSel(); saveState();
   FULL=[];
   $("#detail").innerHTML="<div class=empty>loading…</div>";
   const r=await (await fetch("/api/run/"+encodeURIComponent(tr.dataset.id))).json();
@@ -871,7 +894,7 @@ async function open(tr){
 
 async function openSession(sid){
   if(detailHidden())setDetail(false);
-  SELSESS=sid; SELID=null; markSel();
+  SELSESS=sid; SELID=null; markSel(); saveState();
   FULL=[];
   $("#detail").innerHTML="<div class=empty>loading whole session…</div>";
   const s=await (await fetch("/api/session/"+encodeURIComponent(sid))).json();
@@ -894,16 +917,20 @@ function wireActions(){
   });
 }
 
-$("#agent").onchange=load;$("#failed").onchange=load;
+$("#agent").onchange=()=>{AGENT=$("#agent").value;saveState();load()};
+$("#failed").onchange=()=>{saveState();load()};
 // Redraw whatever is open, run or whole session, under the new setting.
 function reopen(){
   if(SELID)open(stubRow(SELID));
   else if(SELSESS)openSession(SELSESS);
 }
-$("#lim").onchange=()=>{LIMIT=+$("#lim").value;reopen()};
-$("#mode").onchange=()=>{MODE=$("#mode").value;reopen()};
-$("#grp").onchange=load;
-let t;$("#q").oninput=()=>{clearTimeout(t);t=setTimeout(load,250)};
+$("#lim").onchange=()=>{LIMIT=+$("#lim").value;saveState();reopen()};
+$("#mode").onchange=()=>{MODE=$("#mode").value;saveState();reopen()};
+$("#grp").onchange=()=>{saveState();load()};
+let t;$("#q").oninput=()=>{clearTimeout(t);t=setTimeout(()=>{saveState();load()},250)};
+// Where you had scrolled to is part of "where you were". Debounced so a flick
+// of the wheel is not a hundred writes.
+let st;$("#list").addEventListener("scroll",()=>{clearTimeout(st);st=setTimeout(saveState,300)},{passive:true});
 
 $("#togdetail").onclick=()=>setDetail(!detailHidden());
 // Backslash toggles it, as long as you are not typing in the search box.
@@ -982,13 +1009,34 @@ checkVersion();
 const stubRow=id=>({dataset:{id},classList:{add(){},remove(){}}});
 async function openHash(){
   const m=/^#run=(.+)$/.exec(location.hash);
-  if(m)await open(stubRow(decodeURIComponent(m[1])));
+  if(!m)return false;
+  await open(stubRow(decodeURIComponent(m[1])));
+  return true;
 }
 addEventListener("hashchange",openHash);
 
 try{if(localStorage.getItem("hideDetail"))setDetail(true)}catch(e){}
 
-load().then(openHash);
+// Put the controls back before the first request, so it asks the server for the
+// rows you were looking at instead of fetching the default set and refetching.
+// The open trace and the scroll position need the list to exist, so they follow.
+if(S0.agent)AGENT=S0.agent;
+if(S0.q)$("#q").value=S0.q;
+if(S0.failed)$("#failed").checked=true;
+if(S0.grp)$("#grp").value=S0.grp;
+if(S0.mode){MODE=S0.mode;$("#mode").value=S0.mode}
+if(S0.lim!=null){LIMIT=+S0.lim;$("#lim").value=S0.lim}
+
+(async()=>{
+  await load();
+  // An explicit #run= link is someone asking for that run by name, so it wins
+  // over whatever happened to be open here last.
+  if(!await openHash()){
+    if(S0.selid)await open(stubRow(S0.selid));
+    else if(S0.selsess)await openSession(S0.selsess);
+  }
+  if(S0.scroll)$("#list").scrollTop=S0.scroll;
+})();
 </script>"""
 
 
