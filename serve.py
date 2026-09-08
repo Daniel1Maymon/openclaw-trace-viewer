@@ -579,6 +579,15 @@ td.sess{cursor:pointer;font-size:11px}td.sess:hover{color:var(--accent);text-dec
 .spwrap>summary{color:var(--dim);font-size:11px}
 .turnbar{position:sticky;top:0;z-index:2;background:var(--accent);color:#fff;font-weight:700;font-size:12px;padding:5px 10px;border-radius:6px;margin:20px 0 8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .turnbar .dim{color:rgba(255,255,255,.8);font-weight:400}
+/* The turn bar doubles as the fold handle, so it needs room for the marker and
+   a marker that reads against the accent fill rather than the page. */
+summary.cardsum.turnbar{padding-left:24px}
+summary.cardsum.turnbar::before{left:9px;top:6px;color:rgba(255,255,255,.85)}
+summary.cardsum.turnbar:hover::before{color:#fff}
+/* Closed turns stack tightly — that compact list is the point of the view. An
+   open one gets air and a rule under it so its contents read as belonging to it. */
+details.turn:not([open])>summary.turnbar{margin:6px 0}
+details.turn[open]{border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:6px}
 .warnbar{background:color-mix(in srgb,var(--warn) 18%,transparent);border:1px solid var(--warn);border-radius:6px;padding:5px 9px;margin-bottom:10px;font-size:12px}
 .tracebtn{cursor:pointer;border:1px solid var(--accent);color:var(--accent);border-radius:9px;padding:1px 7px;font-size:11px;white-space:nowrap}
 .tracebtn:hover{background:var(--accent);color:#fff}
@@ -678,7 +687,8 @@ function saveState(){
     agent:AGENT, failed:$("#failed").checked, q:$("#q").value,
     grp:$("#grp").value, mode:MODE, lim:$("#lim").value,
     selid:SELID, selsess:SELSESS,
-    scroll:$("#list").scrollTop, dscroll:$("#detail").scrollTop}))}catch(e){}
+    scroll:$("#list").scrollTop, dscroll:$("#detail").scrollTop,
+    folds:FOLDS}))}catch(e){}
 }
 function readState(){
   try{return JSON.parse(localStorage.getItem(STATE)||"{}")||{}}catch(e){return{}}
@@ -806,11 +816,11 @@ function msgBody(m){
 
 // The full conversation as it stands going into a call — every message, with
 // the ones added since the previous call marked and open by default.
-function contextBlock(M,SP,c,prev,n,final){
+function contextBlock(M,SP,c,prev,n,final,fold){
   const ctx=M.slice(0,c.i), from=prev==null?0:prev.i;
   const added=ctx.length-from;
   // The counts live inside the summary so a folded card still says what it holds.
-  return `<details class=ctx open>
+  return `<details class=ctx${fold?"":" open"}>
     <summary class=cardsum>
       <div class="ctxhead${final?' fin':''}">${final?`FINAL CONTEXT · after Call #${n}`:`CONTEXT → Call #${n}`}</div>
       <div class=ctxsum>${ctx.length} message${ctx.length===1?"":"s"} · ${size(ctx).toLocaleString()} chars
@@ -822,7 +832,7 @@ function contextBlock(M,SP,c,prev,n,final){
       const isNew=i>=from;
       // Messages carried over from an earlier call start folded; the ones added
       // since start open. Either way the handle is the same.
-      return `<details class="ctxmsg${isNew?" new":""}"${isNew?" open":""}>
+      return `<details class="ctxmsg${isNew?" new":""}"${isNew&&!fold?" open":""}>
         <summary class=cardsum><div class=ctxmsghead><span class=rolechip>#${i+1} ${esc(mlabel(m))}</span>
           ${isNew?'<span class=newbadge>new</span>':''}
           <span class=dim>${mchars(m).toLocaleString()} chars</span></div></summary>
@@ -833,7 +843,7 @@ function contextBlock(M,SP,c,prev,n,final){
   </details>`;
 }
 
-function callBlock(M,C,c,n){
+function callBlock(M,C,c,n,fold){
   const m=M[c.i], ci=C.indexOf(c), nextI=ci+1<C.length?C[ci+1].i:M.length;
   const results=M.slice(c.i+1,nextI).filter(x=>x.role==="toolResult");
   const out = MODE==="raw"
@@ -842,13 +852,13 @@ function callBlock(M,C,c,n){
         ? `<div class=sub><div class=lbl><b>→ ${esc(b.name)}</b><span class=dim>tool call</span></div><div class=keypath>${esc(b.path)}</div>${cut(b.args)}</div>`
         : `<div class=sub><div class=lbl><b>${b.kind}</b></div><div class=keypath>${esc(b.path)}</div>${cut(b.text)}</div>`).join("")
       ||`<div class="dim sub">(no content)</div>`);
-  return `<details class="call ${c.prior?'prior':''}" open>
+  return `<details class="call ${c.prior?'prior':''}"${fold?"":" open"}>
     <summary class=cardsum><div class=callhead>Call #${n} <span class=dim>${off(c)}</span>
       ${m.stopReason?`<span class=pill>${esc(m.stopReason)}</span>`:''}
       ${m.usage?`<span class="pill mono">${esc(tok(m.usage))}</span>`:''}
       ${results.length?`<span class=dim>${results.length} tool result${results.length>1?"s":""}</span>`:''}</div></summary>
-    <details class=outsec open><summary class=cardsum><span class=outlbl>model output</span></summary>${out}</details>
-    ${results.map(t=>`<details class="sub tool ${t.isError?'err':''}" open>
+    <details class=outsec${fold?"":" open"}><summary class=cardsum><span class=outlbl>model output</span></summary>${out}</details>
+    ${results.map(t=>`<details class="sub tool ${t.isError?'err':''}"${fold?"":" open"}>
       <summary class=cardsum><span class=lbl><b>${esc(t.toolName)}</b><span class=dim>${off(t)}</span>${t.isError?'<span class=bad>error</span>':''}</span></summary>
       ${MODE==="raw"?cut(J(t.raw),hl):`
       ${t.args?`<details><summary>arguments</summary>${cut(t.args)}</details>`:""}
@@ -859,15 +869,16 @@ function callBlock(M,C,c,n){
 
 function renderRun(r,d,opts){
   const M=d.messages||[], C=d.calls||[], SP=d.systemPrompt||"";
+  const fold=(opts||{}).folded;
   const own=C.filter(c=>!c.prior), pri=C.filter(c=>c.prior);
   const body=own.map((c,i)=>{
     const prev=i===0?(pri.length?pri[pri.length-1]:null):own[i-1];
-    return contextBlock(M,SP,c,prev,i+1)+callBlock(M,C,c,i+1);
+    return contextBlock(M,SP,c,prev,i+1,false,fold)+callBlock(M,C,c,i+1,fold);
   }).join("")+(own.length
-    ? contextBlock(M,SP,{i:M.length},own[own.length-1],own.length,true)
+    ? contextBlock(M,SP,{i:M.length},own[own.length-1],own.length,true,fold)
     : "");
   const priorBody=(pri.length&&!(opts||{}).hidePrior)
-    ? `<details class=priorwrap><summary>${pri.length} call${pri.length>1?"s":""} inherited from earlier turns in this session</summary>${pri.map((c,i)=>callBlock(M,C,c,"P"+(i+1))).join("")}</details>`:"";
+    ? `<details class=priorwrap><summary>${pri.length} call${pri.length>1?"s":""} inherited from earlier turns in this session</summary>${pri.map((c,i)=>callBlock(M,C,c,"P"+(i+1),fold)).join("")}</details>`:"";
   const users=M.filter(m=>m.role==="user"&&!m.prior);
   return `${users.map(u=>`<div class=usermsg><div class=lbl><b>user message</b><span class=dim>${off(u)}</span></div>${cut((u.blocks||[]).map(b=>b.text).join("\n"))}</div>`).join("")}
     <div class="mono dim" style="margin:6px 0">${own.length} model call${own.length===1?"":"s"}${pri.length?` · ${pri.length} inherited`:""} · context ${size(M).toLocaleString()} chars by the end</div>
@@ -897,7 +908,7 @@ async function open(tr){
     `<div class="mono dim" style="margin-bottom:10px">${esc(r.session_key||"")}<br>run ${esc(r.run_id)}</div>`+
     `<details><summary>${(d.tools||[]).length} tools available to the model</summary>${cut((d.tools||[]).join("\n"))}</details>`+
     renderRun(r,d);
-  wireActions();
+  wireActions(); applyFolds();
 }
 
 async function openSession(sid){
@@ -908,16 +919,26 @@ async function openSession(sid){
   SELSESS=sid; SELID=null; markSel(); saveState();
   const s=await (await fetch("/api/session/"+encodeURIComponent(sid))).json();
   if(s.error){$("#detail").innerHTML=`<div class=empty>${esc(s.error)}</div>`;return}
-  const turns=s.runs.map((r,i)=>`
-    <div class=turnbar>TURN ${i+1} of ${s.turns} <span class=dim>${when(r.started_ts)} · ${dur(r.duration_ms)} · $${(r.cost_usd||0).toFixed(4)}</span>
-      ${r.ok?"":`<span class=bad>✕ ${esc(r.failure_kind||"failed")}</span>`}</div>
-    ${renderRun(r,r.detail||{},{hidePrior:true})}`).join("");
+  // A session is the view you open to find one turn, not to read all of them.
+  // Every turn starts closed, so what you land on is a short stack of turn bars
+  // you can click — and what is inside a turn you open starts closed too, or the
+  // scrolling problem just moves one level down.
+  const turns=s.runs.map((r,i)=>{
+    const calls=((r.detail||{}).calls||[]).filter(c=>!c.prior).length;
+    return `<details class=turn>
+      <summary class="cardsum turnbar">TURN ${i+1} of ${s.turns}
+        <span class=dim>${when(r.started_ts)} · ${dur(r.duration_ms)} · $${(r.cost_usd||0).toFixed(4)}
+          · ${calls} call${calls===1?"":"s"}${r.tool_count?` · ${r.tool_count} tool${r.tool_count===1?"":"s"}`:""}</span>
+        ${r.ok?"":`<span class=bad>✕ ${esc(r.failure_kind||"failed")}</span>`}</summary>
+      ${renderRun(r,r.detail||{},{hidePrior:true,folded:true})}
+    </details>`;
+  }).join("");
   $("#detail").innerHTML=
     hdr(s,`<span class=pill>${s.turns} turns</span><span class=pill>${s.tool_count} tool calls</span>`)+
     `<div class="mono dim" style="margin-bottom:10px">${esc(s.session_key||"")}<br>session ${esc(s.session_id)}</div>`+
     (s.truncated?`<div class=warnbar>showing the first 25 of ${s.turns} turns</div>`:"")+
     turns;
-  wireActions();
+  wireActions(); applyFolds();
 }
 
 function wireActions(){
@@ -937,10 +958,9 @@ $("#lim").onchange=()=>{LIMIT=+$("#lim").value;saveState();reopen()};
 $("#mode").onchange=()=>{MODE=$("#mode").value;saveState();reopen()};
 $("#grp").onchange=()=>{saveState();load()};
 let t;$("#q").oninput=()=>{clearTimeout(t);t=setTimeout(()=>{saveState();load()},250)};
-// Where you had scrolled to is part of "where you were". Debounced so a flick
-// of the wheel is not a hundred writes.
-// Where you had scrolled to, in both panes — a long session trace is the one
-// you are most likely to be deep inside when you click away to Reliability.
+// Where you had scrolled to, in both panes, debounced so a flick of the wheel
+// is not a hundred writes. A long session trace is the one you are most likely
+// to be deep inside when you click away to Reliability.
 let st;const onscroll=()=>{clearTimeout(st);st=setTimeout(saveState,300)};
 $("#list").addEventListener("scroll",onscroll,{passive:true});
 $("#detail").addEventListener("scroll",onscroll,{passive:true});
@@ -955,13 +975,52 @@ document.addEventListener("keydown",e=>{
 });
 // Every card is its own <details>, so one button has to mean something sensible
 // for a mixed state: if anything is open, close everything; otherwise open it.
-const CARDS="details.ctx,details.call,details.ctxmsg,details.outsec,details.sub";
+const CARDS="details.turn,details.ctx,details.call,details.ctxmsg,details.outsec,details.sub";
+// Two different sets. "fold all" acts on the cards, because folding the little
+// "arguments"/"result" disclosures with them would be noise. Remembering, on the
+// other hand, covers every disclosure in the pane — opening the system prompt is
+// a choice too, and losing it on a page switch is the thing being fixed.
+const foldCards=()=>[...$("#detail").querySelectorAll(CARDS)];
+const allCards=()=>[...$("#detail").querySelectorAll("details")];
+
+// Which cards you left open is part of where you were, so it is remembered with
+// the rest. Cards are identified by their position in the rendered trace rather
+// than by an id: the render is deterministic for a given trace at a given mode
+// and limit, so position is stable, and all three go into the key. Anything that
+// does not match — a different trace, a re-indexed run that now renders more
+// cards — falls back to the defaults instead of opening the wrong ones.
+let FOLDS=S0.folds||null;
+const foldKey=()=>`${SELID?"r:"+SELID:SELSESS?"s:"+SELSESS:"-"}|${MODE}|${LIMIT}`;
+function foldSnap(){
+  const els=allCards();
+  // Called while the pane is showing "loading…" too; there is nothing to read
+  // then, and the previous snapshot is the honest answer.
+  return els.length?{key:foldKey(),bits:els.map(e=>e.open?"1":"0").join("")}:FOLDS;
+}
+function applyFolds(){
+  const els=allCards();
+  if(FOLDS&&FOLDS.key===foldKey()&&FOLDS.bits.length===els.length)
+    els.forEach((e,i)=>e.open=FOLDS.bits[i]==="1");
+  FOLDS=foldSnap(); saveState();
+  syncFoldBtn();
+}
+function syncFoldBtn(){
+  const els=foldCards();
+  if(!els.length)return;   // nothing open in the pane; leave the label alone
+  $("#foldall").textContent=els.some(x=>x.open)?"fold all":"unfold all";
+}
+// toggle does not bubble, so it is caught on the way down.
+let ft;$("#detail").addEventListener("toggle",()=>{
+  clearTimeout(ft);
+  ft=setTimeout(()=>{FOLDS=foldSnap();saveState();syncFoldBtn()},200);
+},true);
+
 $("#foldall").onclick=()=>{
-  const els=[...$("#detail").querySelectorAll(CARDS)];
+  const els=foldCards();
   if(!els.length)return;
   const anyOpen=els.some(x=>x.open);
   els.forEach(x=>x.open=!anyOpen);
-  $("#foldall").textContent=anyOpen?"unfold all":"fold all";
+  FOLDS=foldSnap(); saveState(); syncFoldBtn();
 };
 
 // ---------- staying up to date ----------
