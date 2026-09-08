@@ -354,9 +354,10 @@ def query_runs(q):
             g = sess.setdefault(r["session_id"], {
                 "session_id": r["session_id"], "agent": r["agent"],
                 "session_key": r["session_key"], "model": r["model"],
+                "provider": r["provider"],
                 "trigger": r["trigger"], "started_ts": r["started_ts"],
                 "last_ts": r["started_ts"], "turns": 0, "duration_ms": 0,
-                "cost_usd": 0.0, "tool_count": 0, "failed": 0,
+                "cost_usd": 0.0, "tool_count": 0, "tool_err": 0, "failed": 0,
                 "total_tokens": 0, "user_text": "", "runs": [],
             })
             g["turns"] += 1
@@ -364,6 +365,11 @@ def query_runs(q):
             g["duration_ms"] += r["duration_ms"] or 0
             g["cost_usd"] += r["cost_usd"] or 0.0
             g["tool_count"] += r["tool_count"] or 0
+            # A session that rolls up its turns must roll up their tool errors too.
+            # Without this a collapsed row showed "21 tools" for a session where 14
+            # of them failed — the exact run the fleet has 292 of, hidden behind a
+            # summary that looked clean.
+            g["tool_err"] += r["error_tool_count"] or 0
             g["total_tokens"] = max(g["total_tokens"], r["total_tokens"] or 0)
             g["failed"] += 0 if r["ok"] else 1
             if not g["user_text"] and r["user_text"]:
@@ -377,9 +383,23 @@ def query_runs(q):
                   "grouped": False}
 
     tot = con.execute("SELECT COUNT(*), SUM(ok=0), ROUND(SUM(cost_usd),4), "
-                      "COUNT(DISTINCT session_id) FROM runs").fetchone()
+                      "COUNT(DISTINCT session_id), SUM(ok=1 AND error_tool_count>0) "
+                      "FROM runs").fetchone()
+    # A provider that has never once reported a price is not a cheap provider, it
+    # is an unmeasured one. Rendering its runs as "—" alongside real $0.0019 rows
+    # invites you to read the fleet total as the whole bill when a third of the
+    # fleet was never counted. Derived, not hardcoded: a provider that starts
+    # reporting prices tomorrow drops off this list by itself.
+    unpriced = [r[0] for r in con.execute(
+        "SELECT provider FROM runs GROUP BY provider "
+        "HAVING COALESCE(MAX(cost_usd), 0) = 0")]
+    unpriced_runs = con.execute(
+        "SELECT COUNT(*) FROM runs WHERE provider IN (SELECT provider FROM runs "
+        "GROUP BY provider HAVING COALESCE(MAX(cost_usd), 0) = 0)").fetchone()[0]
     result.update({"redact": REDACT,
                    "total": tot[0], "failed": tot[1], "cost": tot[2], "sessions": tot[3],
+                   "quiet_fail": tot[4] or 0,
+                   "unpriced": unpriced, "unpriced_runs": unpriced_runs,
                    "agents": [r[0] for r in con.execute(
                        "SELECT DISTINCT agent FROM runs ORDER BY 1")]})
     con.close()
@@ -559,6 +579,9 @@ details>summary{cursor:pointer;color:var(--accent);font-size:12px;padding:3px 0}
 .actor{font-size:10px;letter-spacing:.08em;color:var(--dim);text-transform:uppercase;font-weight:600}
 .saidwhat{font-size:11px;color:var(--warn);font-family:ui-monospace,Menlo,monospace}
 .gap{font-size:10px;color:var(--dim);opacity:.75}
+/* Finished ok, but something broke on the way. Not red — it did not fail — but
+   not silent either, because this is the run OpenClaw's cost view calls fine. */
+.quiet{color:var(--warn);font-size:11px;border:1px solid var(--warn);border-radius:3px;padding:0 4px;opacity:.85}
 .sub{margin:0 0 6px 10px;border-left:2px solid var(--line);padding-left:8px}
 .sub.tool{border-left-color:var(--accent)}.sub.err{border-left-color:var(--bad)}
 /* A tool run is the *consequence* of the model output, not a part of it. Indenting
@@ -706,6 +729,9 @@ let AGENT="";
 // stale and the highlight vanishes while the trace beside it is still open.
 // One of these two is set, never both.
 let SELID=null, SELSESS=null;
+// Providers that have never reported a price. Filled from /api/runs so it stays
+// true as providers change, and read by money() below.
+let UNPRICED=new Set();
 
 // ---------- remembering where you were ----------
 // Traces and Reliability are separate URLs, so switching between them is a full
@@ -783,12 +809,27 @@ async function load(){
     $("#agent").dataset.done=1;
     $("#agent").value=AGENT;   // the restored filter finally has an option to point at
   }
+  UNPRICED=new Set(d.unpriced||[]);
   $("#stats").innerHTML=(d.redact?`<span class=redbadge>REDACTED — placeholder content</span> `:"")
-    +esc(`${d.total} runs in ${d.sessions} sessions · ${d.failed} failed · $${d.cost} total · showing ${d.rows.length}`);
+    +esc(`${d.total} runs in ${d.sessions} sessions · ${d.failed} failed`)
+    // Runs that finished "successfully" while tools were failing under them. They
+    // are not in the failed count and never will be — that is the point of showing
+    // them next to it rather than folding them in.
+    +(d.quiet_fail?` · <span class=quiet title="finished ok, but at least one tool call failed inside them — not counted as failures">${d.quiet_fail} ok with tool errors</span>`:"")
+    +esc(` · $${d.cost}`)
+    +(d.unpriced_runs?` <span class=dim title="${esc((d.unpriced||[]).join(", "))} report no pricing, so these runs are not in the total">(${d.unpriced_runs} runs unpriced)</span>`:"")
+    +esc(` · showing ${d.rows.length}`);
 
   const head=d.grouped
     ? `<tr><th></th><th>last activity</th><th>agent</th><th>session</th><th>first message</th><th>turns</th><th>total</th><th>tools</th><th>cost</th></tr>`
     : `<tr><th>when</th><th>agent</th><th>session</th><th>message</th><th>took</th><th>tools</th><th>cost</th></tr>`;
+
+  // "—" reads as zero. For a provider that never reports a price it means "we do
+  // not know", and those are different enough to debug differently.
+  const money=r=>r.cost_usd?`$${r.cost_usd.toFixed(4)}`
+    :UNPRICED.has(r.provider)?`<span class=dim title="${esc(r.provider||"")} reports no pricing">n/a</span>`
+    :"—";
+  const toolcell=r=>`${r.tool_count||0}${r.error_tool_count?` <span class=bad title="${r.error_tool_count} of these tool calls failed">${r.error_tool_count}✕</span>`:""}`;
 
   const runRow=(r,child)=>`<tr data-id="${r.run_id}" class="${child?'child':''}">
       ${child?`<td class=dim></td><td class="mono dim">${when(r.started_ts).slice(11)}</td><td class=dim>turn ${r.turn_n}</td><td></td>`
@@ -799,19 +840,19 @@ async function load(){
                <td class="mono sess" data-sess="${r.session_id}">${r.session_id.slice(0,8)}${r.turn_tot>1?`<br><span class=dim>turn ${r.turn_n}/${r.turn_tot}</span>`:""}</td>`}
       <td class=msg title="${esc(r.user_text)}">${child&&!r.ok?`<span class=bad>✕ ${esc(r.failure_kind||"failed")}</span> `:""}${esc(r.user_text)||'<span class=dim>—</span>'}</td>
       <td class=mono>${dur(r.duration_ms)}</td>
-      <td class=mono>${r.tool_count||0}${r.error_tool_count?` <span class=bad>${r.error_tool_count}✕</span>`:""}</td>
-      <td class=mono>${r.cost_usd?("$"+r.cost_usd.toFixed(4)):"—"}</td></tr>`;
+      <td class=mono>${toolcell(r)}</td>
+      <td class=mono>${money(r)}</td></tr>`;
 
   const sessRow=g=>`<tr class=sessrow data-sess="${g.session_id}">
       <td class=twist>${g.turns>1?"▶":""}</td>
       <td class="mono dim">${when(g.last_ts)}</td>
-      <td>${esc(g.agent)}${g.failed?` <span class=bad>✕${g.failed>1?" "+g.failed:""}</span>`:""}</td>
+      <td>${esc(g.agent)}${g.failed?` <span class=bad>✕${g.failed>1?" "+g.failed:""}</span>`:""}${!g.failed&&g.tool_err?` <span class=quiet title="every turn finished ok, but ${g.tool_err} tool calls failed inside them">${g.tool_err}✕ tools</span>`:""}</td>
       <td class="mono dim">${g.session_id.slice(0,8)}<br><span class=dim>${esc(g.trigger||"")}</span></td>
       <td class=msg title="${esc(g.user_text)}">${esc(g.user_text)||'<span class=dim>—</span>'}</td>
       <td class=mono><span class=tracebtn data-sess="${g.session_id}" title="open the whole session as one trace">▶ ${g.turns}</span></td>
       <td class=mono>${dur(g.duration_ms)}</td>
-      <td class=mono>${g.tool_count||0}</td>
-      <td class=mono>${g.cost_usd?("$"+g.cost_usd.toFixed(4)):"—"}</td></tr>`;
+      <td class=mono>${g.tool_count||0}${g.tool_err?` <span class=bad title="${g.tool_err} of these tool calls failed">${g.tool_err}✕</span>`:""}</td>
+      <td class=mono>${money(g)}</td></tr>`;
 
   const bodyRows=d.grouped
     ? d.rows.map(g=>g.turns===1?sessRow(g).replace("<tr class=sessrow","<tr data-id=\""+g.runs[0].run_id+"\" class=\"sessrow single\"")
