@@ -671,7 +671,8 @@ function saveState(){
   try{localStorage.setItem(STATE,JSON.stringify({
     agent:AGENT, failed:$("#failed").checked, q:$("#q").value,
     grp:$("#grp").value, mode:MODE, lim:$("#lim").value,
-    selid:SELID, selsess:SELSESS, scroll:$("#list").scrollTop}))}catch(e){}
+    selid:SELID, selsess:SELSESS,
+    scroll:$("#list").scrollTop, dscroll:$("#detail").scrollTop}))}catch(e){}
 }
 function readState(){
   try{return JSON.parse(localStorage.getItem(STATE)||"{}")||{}}catch(e){return{}}
@@ -877,9 +878,10 @@ const hdr=(r,extra)=>`<div class=lbl style="margin-bottom:8px;flex-wrap:wrap">
 
 async function open(tr){
   if(detailHidden())setDetail(false);
-  SELID=tr.dataset.id; SELSESS=null; markSel(); saveState();
   FULL=[];
   $("#detail").innerHTML="<div class=empty>loading…</div>";
+  $("#detail").scrollTop=0;
+  SELID=tr.dataset.id; SELSESS=null; markSel(); saveState();
   const r=await (await fetch("/api/run/"+encodeURIComponent(tr.dataset.id))).json();
   const d=r.detail||{};
   if(d.error){$("#detail").innerHTML=`<div class=empty>${esc(d.error)}</div>`;return}
@@ -894,9 +896,10 @@ async function open(tr){
 
 async function openSession(sid){
   if(detailHidden())setDetail(false);
-  SELSESS=sid; SELID=null; markSel(); saveState();
   FULL=[];
   $("#detail").innerHTML="<div class=empty>loading whole session…</div>";
+  $("#detail").scrollTop=0;
+  SELSESS=sid; SELID=null; markSel(); saveState();
   const s=await (await fetch("/api/session/"+encodeURIComponent(sid))).json();
   if(s.error){$("#detail").innerHTML=`<div class=empty>${esc(s.error)}</div>`;return}
   const turns=s.runs.map((r,i)=>`
@@ -930,7 +933,11 @@ $("#grp").onchange=()=>{saveState();load()};
 let t;$("#q").oninput=()=>{clearTimeout(t);t=setTimeout(()=>{saveState();load()},250)};
 // Where you had scrolled to is part of "where you were". Debounced so a flick
 // of the wheel is not a hundred writes.
-let st;$("#list").addEventListener("scroll",()=>{clearTimeout(st);st=setTimeout(saveState,300)},{passive:true});
+// Where you had scrolled to, in both panes — a long session trace is the one
+// you are most likely to be deep inside when you click away to Reliability.
+let st;const onscroll=()=>{clearTimeout(st);st=setTimeout(saveState,300)};
+$("#list").addEventListener("scroll",onscroll,{passive:true});
+$("#detail").addEventListener("scroll",onscroll,{passive:true});
 
 $("#togdetail").onclick=()=>setDetail(!detailHidden());
 // Backslash toggles it, as long as you are not typing in the search box.
@@ -1036,6 +1043,8 @@ if(S0.lim!=null){LIMIT=+S0.lim;$("#lim").value=S0.lim}
     else if(S0.selsess)await openSession(S0.selsess);
   }
   if(S0.scroll)$("#list").scrollTop=S0.scroll;
+  if(S0.dscroll)$("#detail").scrollTop=S0.dscroll;
+  saveState();
 })();
 </script>"""
 
