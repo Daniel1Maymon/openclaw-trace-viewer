@@ -548,9 +548,9 @@ details>summary{cursor:pointer;color:var(--accent);font-size:12px;padding:3px 0}
 .call.prior{opacity:.55}
 .callhead{font-weight:600;font-size:13px;margin-bottom:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .outlbl{font-size:10px;letter-spacing:.08em;color:var(--dim);margin:8px 0 3px;text-transform:uppercase}
-/* Who did this. The model produced the output; OpenClaw ran the tool. They are
-   two actors, one after the other, so they get identical treatment and sit at
-   the same indent — see the flush rule below .sub. */
+/* Two outputs from two producers, one after the other: the model's, then the
+   tool's. Identical treatment and the same indent, so they read as the matched
+   pair they are — see the flush rule below .sub. */
 .actor{font-size:10px;letter-spacing:.08em;color:var(--dim);text-transform:uppercase;font-weight:600}
 .saidwhat{font-size:11px;color:var(--warn);font-family:ui-monospace,Menlo,monospace}
 .gap{font-size:10px;color:var(--dim);opacity:.75}
@@ -899,7 +899,7 @@ function callBlock(M,C,c,n,fold){
       <span class=saidwhat>${asked.length?`→ use ${asked.map(esc).join(", ")}`:"final answer · no tool"}</span></span></summary>${out}</details>
     ${results.map(t=>`<details class="sub tool ${t.isError?'err':''}"${fold?"":" open"}>
       <summary class=cardsum><span class=lbl>
-        <span class=actor>openclaw ran</span><b>${esc(t.toolName)}</b>
+        <span class=actor>tool output</span><b>${esc(t.toolName)}</b>
         <span class=dim>${off(t)}</span>
         ${t.offset!=null&&c.offset!=null?`<span class=gap>${((t.offset-c.offset)/1000).toFixed(1)}s after the model replied</span>`:''}
         ${t.isError?'<span class=bad>error</span>':''}
