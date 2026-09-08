@@ -526,7 +526,12 @@ main.nodetail #list{border-right:none}
 table{width:100%;border-collapse:collapse}
 th{position:sticky;top:0;background:var(--bg);text-align:left;font-weight:600;font-size:11px;color:var(--dim);padding:6px 8px;border-bottom:1px solid var(--line);text-transform:uppercase;letter-spacing:.04em}
 td{padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
-tr[data-id]{cursor:pointer}tr[data-id]:hover td{background:var(--card)}tr.sel td{background:var(--card);box-shadow:inset 3px 0 var(--accent)}
+tr[data-id]{cursor:pointer}tr[data-id]:hover td{background:var(--card)}
+/* The selected row has to be findable at a glance in a list of 200. --card alone
+   is a couple of percent off the page background and disappears in dark mode. */
+tr.sel td{background:color-mix(in srgb,var(--accent) 15%,transparent);box-shadow:inset 4px 0 var(--accent)}
+tr.sel td:first-child{font-weight:600}
+tr.sel .dim,tr.sel .msg{color:var(--fg)}
 .msg{color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
 .bad{color:var(--bad);font-weight:600}.dim{color:var(--dim)}
@@ -643,7 +648,24 @@ function detailHidden(){return document.querySelector("main").classList.contains
 const esc=s=>(s??"").toString().replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const dur=ms=>ms==null?"—":ms<1000?ms+"ms":ms<60000?(ms/1000).toFixed(1)+"s":Math.floor(ms/60000)+"m"+Math.round(ms%60000/1000)+"s";
 const when=t=>t?t.replace("T"," ").replace(/\..*/,""):"—";
-let sel=null, FULL=[], LIMIT=2000, MODE="readable";
+let FULL=[], LIMIT=2000, MODE="readable";
+
+// What is open in the trace pane, kept as ids rather than as an element. The
+// list is rebuilt from scratch on every refresh, so an element reference goes
+// stale and the highlight vanishes while the trace beside it is still open.
+// One of these two is set, never both.
+let SELID=null, SELSESS=null;
+
+// Re-apply the highlight to whatever row now represents the open trace. Safe to
+// call when nothing matches — a run can be open that the current filter or limit
+// leaves out of the list entirely.
+function markSel(){
+  const l=$("#list");
+  l.querySelectorAll("tr.sel").forEach(t=>t.classList.remove("sel"));
+  const row=SELID?l.querySelector(`tr[data-id="${CSS.escape(SELID)}"]`)
+          :SELSESS?l.querySelector(`tr.sessrow[data-sess="${CSS.escape(SELSESS)}"]`):null;
+  if(row)row.classList.add("sel");
+}
 
 // Long values are truncated for readability only — never dropped. The full
 // text stays in memory and "show all" reveals it, so nothing here is hidden.
@@ -728,13 +750,12 @@ async function load(){
   $("#list").querySelectorAll("tr.child").forEach(tr=>tr.style.display="none");
   $("#list").querySelectorAll(".tracebtn").forEach(el=>el.onclick=e=>{
     e.stopPropagation();
-    $("#list").querySelectorAll("tr").forEach(t=>t.classList.remove("sel"));
-    el.closest("tr").classList.add("sel"); sel=null;
     openSession(el.dataset.sess);
   });
   $("#list").querySelectorAll("td.sess").forEach(td=>td.onclick=e=>{
     e.stopPropagation(); $("#q").value=td.dataset.sess; $("#grp").value="run"; load();
   });
+  markSel();   // the table was just rebuilt; put the highlight back
 }
 
 // ---------------------------------------------------------------- rendering
@@ -833,8 +854,7 @@ const hdr=(r,extra)=>`<div class=lbl style="margin-bottom:8px;flex-wrap:wrap">
 
 async function open(tr){
   if(detailHidden())setDetail(false);
-  if(sel)sel.classList.remove("sel");
-  sel=tr;tr.classList.add("sel");
+  SELID=tr.dataset.id; SELSESS=null; markSel();
   FULL=[];
   $("#detail").innerHTML="<div class=empty>loading…</div>";
   const r=await (await fetch("/api/run/"+encodeURIComponent(tr.dataset.id))).json();
@@ -851,6 +871,7 @@ async function open(tr){
 
 async function openSession(sid){
   if(detailHidden())setDetail(false);
+  SELSESS=sid; SELID=null; markSel();
   FULL=[];
   $("#detail").innerHTML="<div class=empty>loading whole session…</div>";
   const s=await (await fetch("/api/session/"+encodeURIComponent(sid))).json();
@@ -874,8 +895,13 @@ function wireActions(){
 }
 
 $("#agent").onchange=load;$("#failed").onchange=load;
-$("#lim").onchange=()=>{LIMIT=+$("#lim").value;if(sel)open(sel)};
-$("#mode").onchange=()=>{MODE=$("#mode").value;if(sel)open(sel)};
+// Redraw whatever is open, run or whole session, under the new setting.
+function reopen(){
+  if(SELID)open(stubRow(SELID));
+  else if(SELSESS)openSession(SELSESS);
+}
+$("#lim").onchange=()=>{LIMIT=+$("#lim").value;reopen()};
+$("#mode").onchange=()=>{MODE=$("#mode").value;reopen()};
 $("#grp").onchange=load;
 let t;$("#q").oninput=()=>{clearTimeout(t);t=setTimeout(load,250)};
 
@@ -927,7 +953,9 @@ async function checkVersion(){
   if(v.v===DV)return;
   DV=v.v;
   // A trace is open — someone is reading. Offer the update, don't impose it.
-  if(sel){$("#newpill").hidden=false}
+  // A whole-session trace counts: it used to fall through to a silent reload,
+  // which rebuilt the list and dropped the highlight out from under the reader.
+  if(SELID||SELSESS){$("#newpill").hidden=false}
   else await reloadKeepingPlace();
 }
 
