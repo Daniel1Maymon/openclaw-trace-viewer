@@ -560,7 +560,10 @@ details>summary{cursor:pointer;color:var(--accent);font-size:12px;padding:3px 0}
    it under the output said the opposite — wrong actor, wrong causality, and it hid
    the handoff, which is the seam most failures happen at. Flush, and the error
    badge (not a rail) carries the alarm. Nested .sub blocks keep their indent. */
-details.call>.sub.tool{margin-left:0;border-left:0;padding-left:0}
+details.call>.sub.tool{border-left:0;padding-left:0}
+/* One step in from the call header, so they read as belonging to it — but the
+   same step for both, so they stay peers of each other. */
+details.call>details.outsec,details.call>.sub.tool{margin-left:16px}
 details.call>details.outsec>summary.cardsum,
 details.call>.sub.tool>summary.cardsum{margin:8px 0 3px}
 details.inp>summary{color:var(--warn);font-weight:600}
