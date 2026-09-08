@@ -697,7 +697,7 @@ function saveState(){
   try{localStorage.setItem(STATE,JSON.stringify({
     agent:AGENT, failed:$("#failed").checked, q:$("#q").value,
     grp:$("#grp").value, mode:MODE, lim:$("#lim").value,
-    selid:SELID, selsess:SELSESS,
+    selid:SELID, selsess:SELSESS, foldpref:FOLDPREF,
     scroll:$("#list").scrollTop, dscroll:$("#detail").scrollTop,
     folds:FOLDS}))}catch(e){}
 }
@@ -705,6 +705,11 @@ function readState(){
   try{return JSON.parse(localStorage.getItem(STATE)||"{}")||{}}catch(e){return{}}
 }
 const S0=readState();
+// How a trace you have never opened before should arrive. The per-run fold bits
+// further down only fit the trace they were taken from; this is the standing
+// preference behind them, and it survives every navigation, because "closed by
+// default" is a way of working, not a property of one run. Closed is the default.
+let FOLDPREF=S0.foldpref===0?0:1;
 
 // Re-apply the highlight to whatever row now represents the open trace. Safe to
 // call when nothing matches — a run can be open that the current filter or limit
@@ -931,7 +936,7 @@ async function open(tr){
       <span class="pill act" data-sess="${r.session_id}">▶ full session trace (${r.turn_tot||1} turns)</span>`)+
     `<div class="mono dim" style="margin-bottom:10px">${esc(r.session_key||"")}<br>run ${esc(r.run_id)}</div>`+
     `<details><summary>${(d.tools||[]).length} tools available to the model</summary>${cut((d.tools||[]).join("\n"))}</details>`+
-    renderRun(r,d);
+    renderRun(r,d,{folded:!!FOLDPREF});
   wireActions(); applyFolds();
 }
 
@@ -956,7 +961,7 @@ async function openSession(sid){
         ${r.ok
           ?(r.error_text?`<span class=recovchip title="${esc(r.error_text)}">↻ recovered</span>`:"")
           :`<span class=bad>✕ ${esc(r.failure_kind||"failed")}</span>`}</summary>
-      ${renderRun(r,r.detail||{},{hidePrior:true,folded:true})}
+      ${renderRun(r,r.detail||{},{hidePrior:true,folded:!!FOLDPREF})}
     </details>`;
   }).join("");
   $("#detail").innerHTML=
@@ -1046,6 +1051,9 @@ $("#foldall").onclick=()=>{
   if(!els.length)return;
   const anyOpen=els.some(x=>x.open);
   els.forEach(x=>x.open=!anyOpen);
+  // Pressing this is the clearest statement the page ever gets about how much it
+  // should be showing, so it sets the standing preference, not just this trace.
+  FOLDPREF=anyOpen?1:0;
   FOLDS=foldSnap(); saveState(); syncFoldBtn();
 };
 
