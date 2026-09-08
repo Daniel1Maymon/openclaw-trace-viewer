@@ -557,7 +557,7 @@ pre.expanded{max-height:70vh}
 tr.sessrow{cursor:pointer;font-weight:600}
 tr.sessrow:hover td{background:var(--card)}
 tr.sessrow.open td{background:var(--card)}
-td.twist{width:16px;color:var(--dim);text-align:center;user-select:none}
+td.twist{width:16px;color:var(--dim);text-align:center;user-select:none;font-size:9px}
 tr.child td{background:color-mix(in srgb,var(--card) 60%,transparent);font-weight:400}
 tr.child td:first-child{border-left:3px solid var(--accent)}
 td.sess{cursor:pointer;font-size:11px}td.sess:hover{color:var(--accent);text-decoration:underline}
@@ -589,11 +589,17 @@ nav a.pill:hover{border-color:var(--accent);color:var(--accent)}
 /* Card headers double as fold handles. The global details>summary rule above
    paints summaries accent-blue at 12px, which would flatten every card title,
    so these opt out of it and keep the styling their own head class gives them. */
-summary.cardsum{cursor:pointer;list-style:none;position:relative;padding-left:15px;
+summary.cardsum{cursor:pointer;list-style:none;position:relative;padding-left:17px;
   color:inherit;font-size:inherit}
 summary.cardsum::-webkit-details-marker{display:none}
-summary.cardsum::before{content:"▾";position:absolute;left:0;top:1px;font-size:10px;color:var(--dim)}
-details:not([open])>summary.cardsum::before{content:"▸"}
+/* Same triangle the browser draws on a plain <details>, rotated the same way.
+   The first version used ▾/▸ — the "small triangle" glyphs — at 10px, which is
+   a speck next to the native marker sitting a few lines below it. ▶ is drawn at
+   full size, and rotating one glyph beats swapping two: nothing shifts by a
+   pixel when a card opens. */
+summary.cardsum::before{content:"▶";position:absolute;left:1px;top:.15em;font-size:11px;
+  line-height:1.2;color:var(--dim);transform-origin:45% 55%;transition:transform .12s ease}
+details[open]>summary.cardsum::before{transform:rotate(90deg)}
 summary.cardsum:hover::before{color:var(--accent)}
 details.ctx>summary.cardsum,details.call>summary.cardsum{margin-bottom:2px}
 details.ctxmsg[open]>summary.cardsum{margin-bottom:3px}
@@ -748,7 +754,7 @@ async function load(){
       <td class=mono>${r.cost_usd?("$"+r.cost_usd.toFixed(4)):"—"}</td></tr>`;
 
   const sessRow=g=>`<tr class=sessrow data-sess="${g.session_id}">
-      <td class=twist>${g.turns>1?"▸":""}</td>
+      <td class=twist>${g.turns>1?"▶":""}</td>
       <td class="mono dim">${when(g.last_ts)}</td>
       <td>${esc(g.agent)}${g.failed?` <span class=bad>✕${g.failed>1?" "+g.failed:""}</span>`:""}</td>
       <td class="mono dim">${g.session_id.slice(0,8)}<br><span class=dim>${esc(g.trigger||"")}</span></td>
@@ -767,7 +773,7 @@ async function load(){
   $("#list").querySelectorAll("tr[data-id]").forEach(tr=>tr.onclick=()=>open(tr));
   $("#list").querySelectorAll("tr.sessrow:not(.single)").forEach(tr=>tr.onclick=()=>{
     const on=tr.classList.toggle("open");
-    tr.querySelector(".twist").textContent=on?"▾":"▸";
+    tr.querySelector(".twist").textContent=on?"▼":"▶";
     let n=tr.nextElementSibling;
     while(n&&n.classList.contains("child")){n.style.display=on?"":"none";n=n.nextElementSibling}
   });
