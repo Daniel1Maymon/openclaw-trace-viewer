@@ -414,7 +414,7 @@ def query_health(q):
     limit = int(q.get("limit", ["300"])[0])
     bad = [hide_path(scrub_row(dict(r))) for r in con.execute(
         f"SELECT run_id, session_id, agent, model, trigger, started_ts, duration_ms, "
-        f"status, {LABEL} AS label, total_tokens, cost_usd, tool_count, "
+        f"status, {LABEL} AS label, error_text, total_tokens, cost_usd, tool_count, "
         f"error_tool_count, msg_count, user_text, reply_text "
         f"FROM runs WHERE ok = 0 ORDER BY started_ts DESC LIMIT ?", (limit,))]
     con.close()
@@ -533,6 +533,7 @@ tr.sel td{background:color-mix(in srgb,var(--accent) 15%,transparent);box-shadow
 tr.sel td:first-child{font-weight:600}
 tr.sel .dim,tr.sel .msg{color:var(--fg)}
 .msg{color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.warnchip{color:var(--warn);font-size:11px}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
 .bad{color:var(--bad);font-weight:600}.dim{color:var(--dim)}
 #detail{overflow:auto;padding:16px}
@@ -577,8 +578,18 @@ td.sess{cursor:pointer;font-size:11px}td.sess:hover{color:var(--accent);text-dec
 .ctxmsghead{display:flex;gap:6px;align-items:center;margin-bottom:2px}
 .newbadge{font-size:9px;letter-spacing:.08em;text-transform:uppercase;background:var(--warn);color:#1a1a1a;border-radius:8px;padding:0 6px;font-weight:700}
 .spwrap>summary{color:var(--dim);font-size:11px}
+/* A failed run's own explanation. Loud, because the whole point of the page is
+   answering "what went wrong" without opening a trajectory file by hand. */
+.errbar{background:color-mix(in srgb,var(--bad) 14%,transparent);border:1px solid var(--bad);
+  border-left-width:4px;border-radius:6px;padding:8px 10px;margin:8px 0 12px;font-size:12px}
+.errbar b{color:var(--bad);text-transform:uppercase;font-size:11px;letter-spacing:.04em;
+  display:block;margin-bottom:3px}
+.errbar .msg{color:var(--fg);max-width:none;white-space:normal;font-family:ui-monospace,Menlo,monospace}
+.errbar.recov{background:color-mix(in srgb,var(--warn) 12%,transparent);border-color:var(--warn)}
+.errbar.recov b{color:var(--warn)}
 .turnbar{position:sticky;top:0;z-index:2;background:var(--accent);color:#fff;font-weight:700;font-size:12px;padding:5px 10px;border-radius:6px;margin:20px 0 8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .turnbar .dim{color:rgba(255,255,255,.8);font-weight:400}
+.recovchip{background:var(--warn);color:#000;font-weight:700;font-size:11px;padding:1px 7px;border-radius:5px}
 /* The turn bar doubles as the fold handle, so it needs room for the marker and
    a marker that reads against the accent fill rather than the page. */
 summary.cardsum.turnbar{padding-left:24px}
@@ -756,7 +767,9 @@ async function load(){
   const runRow=(r,child)=>`<tr data-id="${r.run_id}" class="${child?'child':''}">
       ${child?`<td class=dim></td><td class="mono dim">${when(r.started_ts).slice(11)}</td><td class=dim>turn ${r.turn_n}</td><td></td>`
              :`<td class="mono dim">${when(r.started_ts)}</td>
-               <td>${esc(r.agent)}${r.ok?"":` <span class=bad>✕ ${esc(r.failure_kind||"failed")}</span>`}</td>
+               <td>${esc(r.agent)}${r.ok
+                 ?(r.error_text?` <span class=warnchip title="${esc(r.error_text)}">↻ recovered</span>`:"")
+                 :` <span class=bad>✕ ${esc(r.failure_kind||"failed")}</span>`}</td>
                <td class="mono sess" data-sess="${r.session_id}">${r.session_id.slice(0,8)}${r.turn_tot>1?`<br><span class=dim>turn ${r.turn_n}/${r.turn_tot}</span>`:""}</td>`}
       <td class=msg title="${esc(r.user_text)}">${child&&!r.ok?`<span class=bad>✕ ${esc(r.failure_kind||"failed")}</span> `:""}${esc(r.user_text)||'<span class=dim>—</span>'}</td>
       <td class=mono>${dur(r.duration_ms)}</td>
@@ -880,9 +893,20 @@ function renderRun(r,d,opts){
   const priorBody=(pri.length&&!(opts||{}).hidePrior)
     ? `<details class=priorwrap><summary>${pri.length} call${pri.length>1?"s":""} inherited from earlier turns in this session</summary>${pri.map((c,i)=>callBlock(M,C,c,"P"+(i+1),fold)).join("")}</details>`:"";
   const users=M.filter(m=>m.role==="user"&&!m.prior);
-  return `${users.map(u=>`<div class=usermsg><div class=lbl><b>user message</b><span class=dim>${off(u)}</span></div>${cut((u.blocks||[]).map(b=>b.text).join("\n"))}</div>`).join("")}
+  // Same fact, two very different stories. A run that hit this and stopped is a
+  // failure; one that hit it, was restarted by OpenClaw and finished is a run
+  // that worked — and saying so is the difference between a useful dashboard and
+  // one that cries wolf.
+  const err=r.error_text
+    ? (r.ok===0
+        ? `<div class=errbar><b>${esc(r.failure_kind||"failed")}</b><div class=msg>${esc(r.error_text)}</div></div>`
+        : `<div class="errbar recov"><b>recovered${r.attempts>1?` · OpenClaw restarted this run (${r.attempts} attempts)`:""}</b><div class=msg>${esc(r.error_text)}</div></div>`)
+    : "";
+  return `${err}${users.map(u=>`<div class=usermsg><div class=lbl><b>user message</b><span class=dim>${off(u)}</span></div>${cut((u.blocks||[]).map(b=>b.text).join("\n"))}</div>`).join("")}
     <div class="mono dim" style="margin:6px 0">${own.length} model call${own.length===1?"":"s"}${pri.length?` · ${pri.length} inherited`:""} · context ${size(M).toLocaleString()} chars by the end</div>
-    ${priorBody}${body||"<div class=empty>no model call recorded (run never reached the model)</div>"}`;
+    ${priorBody}${body||`<div class=empty>${r.error_text
+      ? "the run ended before any model call — the reason is above"
+      : "no model call recorded, and the run left no reason behind"}</div>`}`;
 }
 
 const hdr=(r,extra)=>`<div class=lbl style="margin-bottom:8px;flex-wrap:wrap">
@@ -929,7 +953,9 @@ async function openSession(sid){
       <summary class="cardsum turnbar">TURN ${i+1} of ${s.turns}
         <span class=dim>${when(r.started_ts)} · ${dur(r.duration_ms)} · $${(r.cost_usd||0).toFixed(4)}
           · ${calls} call${calls===1?"":"s"}${r.tool_count?` · ${r.tool_count} tool${r.tool_count===1?"":"s"}`:""}</span>
-        ${r.ok?"":`<span class=bad>✕ ${esc(r.failure_kind||"failed")}</span>`}</summary>
+        ${r.ok
+          ?(r.error_text?`<span class=recovchip title="${esc(r.error_text)}">↻ recovered</span>`:"")
+          :`<span class=bad>✕ ${esc(r.failure_kind||"failed")}</span>`}</summary>
       ${renderRun(r,r.detail||{},{hidePrior:true,folded:true})}
     </details>`;
   }).join("");
@@ -1148,6 +1174,10 @@ td{padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
 .barwrap{width:150px}
 tr.run{cursor:pointer}tr.run:hover td{background:var(--card)}
 .msg{color:var(--dim);max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* The run's own words under the short label, so the table can be scanned by
+   category and still read for detail without opening anything. */
+.why{color:var(--dim);font-weight:400;font-size:11px;font-family:ui-monospace,Menlo,monospace;
+  max-width:320px;white-space:normal;margin-top:2px}
 .empty{color:var(--dim);padding:40px;text-align:center}
 .offline{background:var(--bad);color:#fff;padding:6px 16px;font-size:12px;font-weight:600}
 .redbadge{background:var(--warn);color:#111;font-weight:700;padding:1px 6px;border-radius:4px;font-size:10px;letter-spacing:.06em}
@@ -1208,7 +1238,8 @@ function render(d){
     ${d.bad_runs.map(r=>`<tr class=run data-id="${esc(r.run_id)}" title="open this run in the trace view">
       <td class="mono dim">${when(r.started_ts)}</td>
       <td>${esc(r.agent)}</td>
-      <td class=bad>${esc(r.label||"failed")}</td>
+      <td class=bad title="${esc(r.error_text||"")}">${esc(r.label||"failed")}${
+        r.error_text?`<div class=why>${esc(r.error_text)}</div>`:""}</td>
       <td class="mono dim">${esc(r.trigger||"—")}</td>
       <td class=msg title="${esc(r.user_text)}">${esc(r.user_text)||'<span class=dim>—</span>'}</td>
       <td class="num mono">${dur(r.duration_ms)}</td>

@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY, session_id TEXT, agent TEXT, session_key TEXT,
   provider TEXT, model TEXT, trigger TEXT, workspace_dir TEXT,
   started_ts TEXT, ended_ts TEXT, duration_ms INTEGER,
-  status TEXT, ok INTEGER, failure_kind TEXT,
+  status TEXT, ok INTEGER, failure_kind TEXT, error_text TEXT, attempts INTEGER,
   input_tokens INTEGER, output_tokens INTEGER, cache_read INTEGER,
   reasoning_tokens INTEGER, total_tokens INTEGER, cost_usd REAL,
   tool_count INTEGER, tool_names TEXT, error_tool_count INTEGER,
@@ -119,6 +119,43 @@ def text_of(content, limit=400):
         return " ".join(out)[:limit]
     return ""
 
+# OpenClaw records why a run died in one of two free-text fields, and neither was
+# being kept: `promptError` when the turn never reached the model, `terminalError`
+# when it reached it and could not deliver. Every wording below was taken from a
+# census of the 1121 trajectory files on the box — nothing here is a guess at a
+# message that might exist, and anything unrecognised keeps its own first clause
+# as the label rather than being flattened into a bucket that hides it.
+ERROR_KINDS = (
+    ("context overflow",                 "context overflow"),
+    ("prompt too large",                 "context overflow"),
+    ("request timed out",                "request timeout"),
+    ("llm idle timeout",                 "idle timeout"),
+    ("aborted by user",                  "user aborted"),
+    ("openclaw_restart_abort",           "restart abort"),
+    ("this operation was aborted",       "aborted"),
+    ("no callable tools remain",         "no tools allowed"),
+    ("session file changed",             "session file changed"),
+    ("non_deliverable_terminal_turn",    "not deliverable"),
+)
+
+def error_text(a):
+    """The run's own explanation, whichever field it landed in."""
+    for k in ("promptError", "terminalError"):
+        v = a.get(k)
+        if v:
+            return str(v)[:300]
+    return ""
+
+def kind_from_text(msg):
+    m = (msg or "").lower()
+    for needle, label in ERROR_KINDS:
+        if needle in m:
+            return label
+    # Unrecognised: keep the leading clause verbatim. A label nobody has seen
+    # before should look unfamiliar, not like one of the known ones.
+    head = msg.split(":")[0].split("|")[0].strip()
+    return head[:40].lower() if head else ""
+
 def failure_kind(a):
     for k, label in (("timedOutByRunBudget", "run budget"),
                      ("timedOutDuringToolExecution", "tool timeout"),
@@ -129,7 +166,9 @@ def failure_kind(a):
                      ("aborted", "aborted")):
         if a.get(k):
             return label
-    return ""
+    # The structured flags are checked first because they are unambiguous; the
+    # message is the fallback, not a competitor.
+    return kind_from_text(error_text(a))
 
 def parse_file(path, agent, has_transcript):
     runs = {}
@@ -154,7 +193,8 @@ def parse_file(path, agent, has_transcript):
                 "session_key": e.get("sessionKey"), "provider": e.get("provider"),
                 "model": e.get("modelId"), "workspace_dir": e.get("workspaceDir"),
                 "trigger": "", "started_ts": None, "ended_ts": None, "status": "",
-                "ok": 0, "failure_kind": "", "input_tokens": 0, "output_tokens": 0,
+                "ok": 0, "failure_kind": "", "error_text": "", "attempts": 0,
+                "input_tokens": 0, "output_tokens": 0,
                 "cache_read": 0, "reasoning_tokens": 0, "total_tokens": 0,
                 "cost_usd": 0.0, "tool_count": 0, "tool_names": "",
                 "error_tool_count": 0, "msg_count": 0, "compaction_count": 0,
@@ -165,12 +205,19 @@ def parse_file(path, agent, has_transcript):
             if not isinstance(d, dict):
                 d = {}
             if t == "session.started":
-                r["started_ts"] = ts
+                # A run that overflows the context is started again from the top
+                # under the same runId, so this fires more than once. The first
+                # timestamp is when the work actually began.
+                r["attempts"] += 1
+                r["started_ts"] = r["started_ts"] or ts
                 r["trigger"] = d.get("trigger") or ""
             elif t == "session.ended":
                 r["ended_ts"] = ts
                 r["status"] = d.get("status") or r["status"]
+                r["error_text"] = r["error_text"] or error_text(d)
+                r["failure_kind"] = r["failure_kind"] or failure_kind(d)
             elif t == "model.completed":
+                r["error_text"] = r["error_text"] or error_text(d)
                 snap = d.get("messagesSnapshot") or []
                 # CUMULATIVE snapshot: it holds the whole conversation. Anything
                 # stamped before this run started belongs to an earlier turn.
@@ -213,6 +260,7 @@ def parse_file(path, agent, has_transcript):
                 r["compaction_count"] = num(d.get("compactionCount"))
                 r["status"] = d.get("finalStatus") or r["status"]
                 r["failure_kind"] = failure_kind(d)
+                r["error_text"] = error_text(d) or r["error_text"]
                 metas = d.get("toolMetas")
                 if isinstance(metas, list) and metas and not r["tool_names"]:
                     names = [m.get("toolName", "?") for m in metas if isinstance(m, dict)]
@@ -236,10 +284,16 @@ def parse_file(path, agent, has_transcript):
                 r["duration_ms"] = None
         else:
             r["duration_ms"] = None
+        # `error_text` is deliberately NOT part of this. A run that hit a context
+        # overflow, was restarted by OpenClaw and then finished is a run that
+        # worked; counting it as failed would inflate the number this whole
+        # dashboard exists to report honestly. The final status decides.
         bad = r["failure_kind"] or (r["status"] or "").lower() in ("error", "failed", "aborted")
         # a run with no model.completed never finished
         incomplete = r["msg_count"] == 0 and r["total_tokens"] == 0
         r["ok"] = 0 if (bad or incomplete) else 1
+        # "incomplete" is a label this indexer invents, so it is the last resort:
+        # only for a run that left no explanation of its own anywhere.
         if incomplete and not r["failure_kind"]:
             r["failure_kind"] = "incomplete"
         out.append(r)
@@ -312,10 +366,28 @@ def sweep(con, verbose=False):
     con.commit()
     return changed, n_rows, errs
 
+def migrate(con):
+    """Add columns that older databases predate. Never drops, never rewrites."""
+    have = {c[1] for c in con.execute("PRAGMA table_info(runs)")}
+    for col, decl in (("error_text", "TEXT"), ("attempts", "INTEGER")):
+        if col not in have:
+            con.execute(f"ALTER TABLE runs ADD COLUMN {col} {decl}")
+            print(f"migrated: added runs.{col}")
+    con.commit()
+
 def main():
     t0 = time.time()
     con = connect()
     con.executescript(SCHEMA)
+    migrate(con)
+    # A new column starts empty for every run already indexed, and the seen-table
+    # shortcut would skip every unchanged file forever. --rescan forgets what was
+    # seen so the files are read again; the rows themselves are still protected by
+    # upsert_sql, so a trimmed file cannot blank out a run it can no longer prove.
+    if "--rescan" in sys.argv:
+        con.execute("DELETE FROM seen")
+        con.commit()
+        print("rescan: forgetting file stats, every trajectory will be re-read")
     changed, n_rows, errs = sweep(con, verbose=True)
     held = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
 
