@@ -548,8 +548,21 @@ details>summary{cursor:pointer;color:var(--accent);font-size:12px;padding:3px 0}
 .call.prior{opacity:.55}
 .callhead{font-weight:600;font-size:13px;margin-bottom:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .outlbl{font-size:10px;letter-spacing:.08em;color:var(--dim);margin:8px 0 3px;text-transform:uppercase}
+/* Who did this. The model produced the output; OpenClaw ran the tool. They are
+   two actors, one after the other, so they get identical treatment and sit at
+   the same indent — see the flush rule below .sub. */
+.actor{font-size:10px;letter-spacing:.08em;color:var(--dim);text-transform:uppercase;font-weight:600}
+.saidwhat{font-size:11px;color:var(--warn);font-family:ui-monospace,Menlo,monospace}
+.gap{font-size:10px;color:var(--dim);opacity:.75}
 .sub{margin:0 0 6px 10px;border-left:2px solid var(--line);padding-left:8px}
 .sub.tool{border-left-color:var(--accent)}.sub.err{border-left-color:var(--bad)}
+/* A tool run is the *consequence* of the model output, not a part of it. Indenting
+   it under the output said the opposite — wrong actor, wrong causality, and it hid
+   the handoff, which is the seam most failures happen at. Flush, and the error
+   badge (not a rail) carries the alarm. Nested .sub blocks keep their indent. */
+details.call>.sub.tool{margin-left:0;border-left:0;padding-left:0}
+details.call>details.outsec>summary.cardsum,
+details.call>.sub.tool>summary.cardsum{margin:8px 0 3px}
 details.inp>summary{color:var(--warn);font-weight:600}
 .usermsg{border-left:3px solid var(--accent);padding-left:8px;margin:0 0 10px}
 button.more{display:block;margin:-2px 0 6px;padding:2px 8px;font-size:11px;border:1px solid var(--line);border-radius:5px;background:var(--card);color:var(--accent);cursor:pointer}
@@ -864,6 +877,11 @@ function contextBlock(M,SP,c,prev,n,final,fold){
 function callBlock(M,C,c,n,fold){
   const m=M[c.i], ci=C.indexOf(c), nextI=ci+1<C.length?C[ci+1].i:M.length;
   const results=M.slice(c.i+1,nextI).filter(x=>x.role==="toolResult");
+  // What the model actually asked for. "toolUse" told you a tool was used and
+  // then made you open the card to find out which one — the request was hidden
+  // while the result was on show. Naming it here makes a folded run scannable.
+  const asked=(m.blocks||[]).filter(b=>b.kind==="toolCall").map(b=>b.name);
+  const rchars=t=>(t.blocks||[]).reduce((n,b)=>n+(b.text||"").length,0);
   const out = MODE==="raw"
     ? `<div class=sub><div class=keypath>the assistant message, verbatim</div>${cut(J(m.raw),hl)}</div>`
     : ((m.blocks||[]).map(b=>b.kind==="toolCall"
@@ -872,15 +890,23 @@ function callBlock(M,C,c,n,fold){
       ||`<div class="dim sub">(no content)</div>`);
   return `<details class="call ${c.prior?'prior':''}"${fold?"":" open"}>
     <summary class=cardsum><div class=callhead>Model call #${n} <span class=dim>${off(c)}</span>
-      ${m.stopReason?`<span class=pill>${esc(m.stopReason)}</span>`:''}
+      ${asked.map(a=>`<span class="pill mono">→ ${esc(a)}</span>`).join("")}
+      ${m.stopReason&&m.stopReason!=="toolUse"?`<span class=pill>${esc(m.stopReason)}</span>`:''}
       ${m.usage?`<span class="pill mono">${esc(tok(m.usage))}</span>`:''}
       ${results.length?`<span class=dim>${results.length} tool result${results.length>1?"s":""}</span>`:''}</div></summary>
-    <details class=outsec${fold?"":" open"}><summary class=cardsum><span class=outlbl>model output</span></summary>${out}</details>
+    <details class=outsec${fold?"":" open"}><summary class=cardsum><span class=lbl>
+      <span class=actor>the model said</span>
+      <span class=saidwhat>${asked.length?`→ use ${asked.map(esc).join(", ")}`:"final answer · no tool"}</span></span></summary>${out}</details>
     ${results.map(t=>`<details class="sub tool ${t.isError?'err':''}"${fold?"":" open"}>
-      <summary class=cardsum><span class=lbl><b>${esc(t.toolName)}</b><span class=dim>${off(t)}</span>${t.isError?'<span class=bad>error</span>':''}</span></summary>
+      <summary class=cardsum><span class=lbl>
+        <span class=actor>openclaw ran</span><b>${esc(t.toolName)}</b>
+        <span class=dim>${off(t)}</span>
+        ${t.offset!=null&&c.offset!=null?`<span class=gap>${((t.offset-c.offset)/1000).toFixed(1)}s after the model replied</span>`:''}
+        ${t.isError?'<span class=bad>error</span>':''}
+        <span class=dim>${rchars(t).toLocaleString()} chars back</span></span></summary>
       ${MODE==="raw"?cut(J(t.raw),hl):`
       ${t.args?`<details><summary>arguments</summary>${cut(t.args)}</details>`:""}
-      <details><summary>result (${(t.blocks||[]).reduce((n,b)=>n+(b.text||"").length,0).toLocaleString()} chars)</summary>${cut((t.blocks||[]).map(b=>b.text).join("\n"))}</details>`}
+      <details><summary>result (${rchars(t).toLocaleString()} chars)</summary>${cut((t.blocks||[]).map(b=>b.text).join("\n"))}</details>`}
     </details>`).join("")}
   </details>`;
 }
