@@ -840,10 +840,10 @@ function contextBlock(M,SP,c,prev,n,final,fold){
   // The counts live inside the summary so a folded card still says what it holds.
   return `<details class=ctx${fold?"":" open"}>
     <summary class=cardsum>
-      <div class="ctxhead${final?' fin':''}">${final?`FINAL CONTEXT · after Call #${n}`:`CONTEXT → Call #${n}`}</div>
+      <div class="ctxhead${final?' fin':''}">${final?`FINAL CONTEXT · after model call #${n}`:`CONTEXT → MODEL CALL #${n}`}</div>
       <div class=ctxsum>${ctx.length} message${ctx.length===1?"":"s"} · ${size(ctx).toLocaleString()} chars
         · system prompt ${SP.length.toLocaleString()} chars
-        ${added>0?`· <span class=grow>${added} new since ${prev==null?"the run started":"Call #"+(final?n:n-1)}</span>`:""}</div>
+        ${added>0?`· <span class=grow>${added} new since ${prev==null?"the run started":"model call #"+(final?n:n-1)}</span>`:""}</div>
     </summary>
     <details class=spwrap><summary>system prompt (${SP.length.toLocaleString()} chars)</summary>${cut(SP)}</details>
     ${ctx.map((m,i)=>{
@@ -871,7 +871,7 @@ function callBlock(M,C,c,n,fold){
         : `<div class=sub><div class=lbl><b>${b.kind}</b></div><div class=keypath>${esc(b.path)}</div>${cut(b.text)}</div>`).join("")
       ||`<div class="dim sub">(no content)</div>`);
   return `<details class="call ${c.prior?'prior':''}"${fold?"":" open"}>
-    <summary class=cardsum><div class=callhead>Call #${n} <span class=dim>${off(c)}</span>
+    <summary class=cardsum><div class=callhead>Model call #${n} <span class=dim>${off(c)}</span>
       ${m.stopReason?`<span class=pill>${esc(m.stopReason)}</span>`:''}
       ${m.usage?`<span class="pill mono">${esc(tok(m.usage))}</span>`:''}
       ${results.length?`<span class=dim>${results.length} tool result${results.length>1?"s":""}</span>`:''}</div></summary>
@@ -896,7 +896,7 @@ function renderRun(r,d,opts){
     ? contextBlock(M,SP,{i:M.length},own[own.length-1],own.length,true,fold)
     : "");
   const priorBody=(pri.length&&!(opts||{}).hidePrior)
-    ? `<details class=priorwrap><summary>${pri.length} call${pri.length>1?"s":""} inherited from earlier turns in this session</summary>${pri.map((c,i)=>callBlock(M,C,c,"P"+(i+1),fold)).join("")}</details>`:"";
+    ? `<details class=priorwrap><summary>${pri.length} model call${pri.length>1?"s":""} inherited from earlier turns in this session</summary>${pri.map((c,i)=>callBlock(M,C,c,"P"+(i+1),fold)).join("")}</details>`:"";
   const users=M.filter(m=>m.role==="user"&&!m.prior);
   // Same fact, two very different stories. A run that hit this and stopped is a
   // failure; one that hit it, was restarted by OpenClaw and finished is a run
@@ -957,7 +957,7 @@ async function openSession(sid){
     return `<details class=turn>
       <summary class="cardsum turnbar">TURN ${i+1} of ${s.turns}
         <span class=dim>${when(r.started_ts)} · ${dur(r.duration_ms)} · $${(r.cost_usd||0).toFixed(4)}
-          · ${calls} call${calls===1?"":"s"}${r.tool_count?` · ${r.tool_count} tool${r.tool_count===1?"":"s"}`:""}</span>
+          · ${calls} model call${calls===1?"":"s"}${r.tool_count?` · ${r.tool_count} tool${r.tool_count===1?"":"s"}`:""}</span>
         ${r.ok
           ?(r.error_text?`<span class=recovchip title="${esc(r.error_text)}">↻ recovered</span>`:"")
           :`<span class=bad>✕ ${esc(r.failure_kind||"failed")}</span>`}</summary>
