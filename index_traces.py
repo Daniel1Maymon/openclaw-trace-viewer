@@ -30,7 +30,27 @@ AGENTS_DIR = os.environ.get("OPENCLAW_AGENTS_DIR", "/root/.openclaw/agents")
 DB = os.environ.get("TRACE_DB",
                     os.path.join(os.path.dirname(os.path.abspath(__file__)), "traces.db"))
 # Agents to leave out of the index (throwaway test agents, by default none).
-SKIP_AGENTS = {a for a in os.environ.get("TRACE_SKIP_AGENTS", "").split(",") if a}
+def _skip_agents():
+    """Agents to leave out of the index.
+
+    `TRACE_SKIP_AGENTS` wins when set, but it is trivially forgotten: the cron
+    line carries it and a hand-started viewer does not, which is how two dead
+    test agents got indexed once already. So when the variable is absent the
+    list comes from `skip_agents.txt` beside this script — one agent per line,
+    `#` comments allowed. That way the setting belongs to the deployment
+    instead of to whoever happens to type the start command.
+    """
+    raw = os.environ.get("TRACE_SKIP_AGENTS")
+    if raw is None:
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "skip_agents.txt")) as fh:
+                raw = ",".join(line.split("#")[0] for line in fh)
+        except OSError:
+            raw = ""
+    return {a.strip() for a in raw.split(",") if a.strip()}
+
+SKIP_AGENTS = _skip_agents()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (

@@ -1,0 +1,7 @@
+# Agents left out of the trace index, one per line.
+# Read by index_traces.py when TRACE_SKIP_AGENTS is not set in the environment,
+# so a hand-started viewer skips them too — not just the cron job.
+# Both of these are dead test agents from 2026-09; their rows were deleted from
+# traces.db once and came straight back because a manual start re-indexed them.
+codemode-test
+loopguard-test

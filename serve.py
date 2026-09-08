@@ -385,6 +385,44 @@ def query_runs(q):
     con.close()
     return result
 
+# A run can be judged on two independent questions, and merging them into one
+# number would misrepresent both:
+#
+#   did it finish?          -> ok / failure_kind, set in index_traces.py
+#   did anything go wrong   -> error_tool_count, counted per tool result
+#   while it ran?
+#
+# A run can fail without a single tool error (it ran out of budget mid-thought),
+# and a run can log a dozen tool errors and still end perfectly — the agent hit
+# a denied command, worked around it, and answered. Both columns, never a sum.
+LABEL = ("CASE WHEN failure_kind IS NOT NULL AND failure_kind != '' THEN failure_kind "
+         "ELSE COALESCE(NULLIF(LOWER(status), ''), 'unknown') END")
+
+def query_health(q):
+    con = db()
+    tot = con.execute(
+        "SELECT COUNT(*), SUM(ok), SUM(1-ok), SUM(error_tool_count > 0), "
+        "SUM(error_tool_count) FROM runs").fetchone()
+    kinds = [{"kind": r[0], "n": r[1]} for r in con.execute(
+        f"SELECT {LABEL}, COUNT(*) FROM runs WHERE ok = 0 GROUP BY 1 ORDER BY 2 DESC")]
+    agents = [{"agent": r[0], "runs": r[1], "bad": r[2], "tool_err": r[3]}
+              for r in con.execute(
+                  "SELECT agent, COUNT(*), SUM(1-ok), SUM(error_tool_count > 0) "
+                  "FROM runs GROUP BY 1 ORDER BY 2 DESC")]
+    # Every failed run, newest first. 66 rows today; the cap is there so a bad
+    # week can't turn this page into a multi-megabyte response.
+    limit = int(q.get("limit", ["300"])[0])
+    bad = [hide_path(scrub_row(dict(r))) for r in con.execute(
+        f"SELECT run_id, session_id, agent, model, trigger, started_ts, duration_ms, "
+        f"status, {LABEL} AS label, total_tokens, cost_usd, tool_count, "
+        f"error_tool_count, msg_count, user_text, reply_text "
+        f"FROM runs WHERE ok = 0 ORDER BY started_ts DESC LIMIT ?", (limit,))]
+    con.close()
+    return {"redact": REDACT, "total": tot[0], "ok": tot[1], "bad": tot[2],
+            "tool_err_runs": tot[3], "tool_err_total": tot[4],
+            "kinds": kinds, "agents": agents, "bad_runs": bad,
+            "truncated": max(0, (tot[2] or 0) - len(bad))}
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -418,6 +456,11 @@ class H(BaseHTTPRequestHandler):
         try:
             if u.path == "/":
                 return self._send(200, PAGE, "text/html; charset=utf-8")
+            if u.path == "/health":
+                return self._send(200, HEALTH_PAGE, "text/html; charset=utf-8")
+            if u.path == "/api/health":
+                return self._send(200, json.dumps(query_health(q), ensure_ascii=False),
+                                  "application/json")
             if u.path == "/api/version":
                 # ~60 bytes. The page asks this every few seconds and only
                 # re-fetches the run list when the value differs from its own.
@@ -535,6 +578,21 @@ td.sess{cursor:pointer;font-size:11px}td.sess:hover{color:var(--accent);text-dec
 .tracebtn{cursor:pointer;border:1px solid var(--accent);color:var(--accent);border-radius:9px;padding:1px 7px;font-size:11px;white-space:nowrap}
 .tracebtn:hover{background:var(--accent);color:#fff}
 .pill.act{border-color:var(--accent);color:var(--accent);font-weight:600}
+nav{display:flex;gap:6px}
+nav a.pill{text-decoration:none;color:var(--dim);margin:0;font-size:13px;padding:5px 14px;border-radius:8px}
+nav a.pill:hover{border-color:var(--accent);color:var(--accent)}
+/* Card headers double as fold handles. The global details>summary rule above
+   paints summaries accent-blue at 12px, which would flatten every card title,
+   so these opt out of it and keep the styling their own head class gives them. */
+summary.cardsum{cursor:pointer;list-style:none;position:relative;padding-left:15px;
+  color:inherit;font-size:inherit}
+summary.cardsum::-webkit-details-marker{display:none}
+summary.cardsum::before{content:"▾";position:absolute;left:0;top:1px;font-size:10px;color:var(--dim)}
+details:not([open])>summary.cardsum::before{content:"▸"}
+summary.cardsum:hover::before{color:var(--accent)}
+details.ctx>summary.cardsum,details.call>summary.cardsum{margin-bottom:2px}
+details.ctxmsg[open]>summary.cardsum{margin-bottom:3px}
+details.outsec>summary.cardsum{margin:8px 0 3px}
 .keypath{font-family:ui-monospace,Menlo,monospace;font-size:10px;color:var(--warn);opacity:.85;margin:1px 0 2px}
 .jk{color:#79b8ff}.js{color:#e2a06a}
 @media(prefers-color-scheme:light){.jk{color:#0550ae}.js{color:#a15c00}}
@@ -546,6 +604,7 @@ td.sess{cursor:pointer;font-size:11px}td.sess:hover{color:var(--accent);text-dec
 </style>
 <header>
   <h1>OpenClaw Traces</h1>
+  <nav><a class="pill act" href="/">Traces</a><a class=pill href="/health">Reliability</a></nav>
   <select id=agent></select>
   <label class=stat><input type=checkbox id=failed> failures only</label>
   <input id=q placeholder="search text / tool / id" size=24>
@@ -560,6 +619,7 @@ td.sess{cursor:pointer;font-size:11px}td.sess:hover{color:var(--accent);text-dec
     <option value=10000>10,000</option><option value=0>all</option>
   </select> chars</label>
   <button id=togdetail title="collapse the trace pane so the list gets the full width (\ toggles)">hide trace</button>
+  <button id=foldall title="collapse every card in the open trace">fold all</button>
   <button id=refresh title="check for new runs right now">refresh</button>
   <button id=newpill class=newpill hidden>▲ new runs — click to load</button>
   <span class=stat id=stats></span>
@@ -698,23 +758,28 @@ function msgBody(m){
 function contextBlock(M,SP,c,prev,n,final){
   const ctx=M.slice(0,c.i), from=prev==null?0:prev.i;
   const added=ctx.length-from;
-  return `<div class=ctx>
-    <div class="ctxhead${final?' fin':''}">${final?`FINAL CONTEXT · after Call #${n}`:`CONTEXT → Call #${n}`}</div>
-    <div class=ctxsum>${ctx.length} message${ctx.length===1?"":"s"} · ${size(ctx).toLocaleString()} chars
-      · system prompt ${SP.length.toLocaleString()} chars
-      ${added>0?`· <span class=grow>${added} new since ${prev==null?"the run started":"Call #"+(final?n:n-1)}</span>`:""}</div>
+  // The counts live inside the summary so a folded card still says what it holds.
+  return `<details class=ctx open>
+    <summary class=cardsum>
+      <div class="ctxhead${final?' fin':''}">${final?`FINAL CONTEXT · after Call #${n}`:`CONTEXT → Call #${n}`}</div>
+      <div class=ctxsum>${ctx.length} message${ctx.length===1?"":"s"} · ${size(ctx).toLocaleString()} chars
+        · system prompt ${SP.length.toLocaleString()} chars
+        ${added>0?`· <span class=grow>${added} new since ${prev==null?"the run started":"Call #"+(final?n:n-1)}</span>`:""}</div>
+    </summary>
     <details class=spwrap><summary>system prompt (${SP.length.toLocaleString()} chars)</summary>${cut(SP)}</details>
     ${ctx.map((m,i)=>{
       const isNew=i>=from;
-      return `<div class="ctxmsg${isNew?" new":""}">
-        <div class=ctxmsghead><span class=rolechip>#${i+1} ${esc(mlabel(m))}</span>
+      // Messages carried over from an earlier call start folded; the ones added
+      // since start open. Either way the handle is the same.
+      return `<details class="ctxmsg${isNew?" new":""}"${isNew?" open":""}>
+        <summary class=cardsum><div class=ctxmsghead><span class=rolechip>#${i+1} ${esc(mlabel(m))}</span>
           ${isNew?'<span class=newbadge>new</span>':''}
-          <span class=dim>${mchars(m).toLocaleString()} chars</span></div>
-        ${isNew?msgBody(m):`<details><summary>show</summary>${msgBody(m)}</details>`}
-      </div>`;
+          <span class=dim>${mchars(m).toLocaleString()} chars</span></div></summary>
+        ${msgBody(m)}
+      </details>`;
     }).join("")||'<div class=dim>(empty context)</div>'}
     <details><summary>whole context as one JSON array</summary>${cut(J(ctx.map(m=>m.raw)),hl)}</details>
-  </div>`;
+  </details>`;
 }
 
 function callBlock(M,C,c,n){
@@ -726,18 +791,19 @@ function callBlock(M,C,c,n){
         ? `<div class=sub><div class=lbl><b>→ ${esc(b.name)}</b><span class=dim>tool call</span></div><div class=keypath>${esc(b.path)}</div>${cut(b.args)}</div>`
         : `<div class=sub><div class=lbl><b>${b.kind}</b></div><div class=keypath>${esc(b.path)}</div>${cut(b.text)}</div>`).join("")
       ||`<div class="dim sub">(no content)</div>`);
-  return `<div class="call ${c.prior?'prior':''}">
-    <div class=callhead>Call #${n} <span class=dim>${off(c)}</span>
+  return `<details class="call ${c.prior?'prior':''}" open>
+    <summary class=cardsum><div class=callhead>Call #${n} <span class=dim>${off(c)}</span>
       ${m.stopReason?`<span class=pill>${esc(m.stopReason)}</span>`:''}
-      ${m.usage?`<span class="pill mono">${esc(tok(m.usage))}</span>`:''}</div>
-    <div class=outlbl>model output</div>${out}
-    ${results.map(t=>`<div class="sub tool ${t.isError?'err':''}">
-      <div class=lbl><b>${esc(t.toolName)}</b><span class=dim>${off(t)}</span>${t.isError?'<span class=bad>error</span>':''}</div>
+      ${m.usage?`<span class="pill mono">${esc(tok(m.usage))}</span>`:''}
+      ${results.length?`<span class=dim>${results.length} tool result${results.length>1?"s":""}</span>`:''}</div></summary>
+    <details class=outsec open><summary class=cardsum><span class=outlbl>model output</span></summary>${out}</details>
+    ${results.map(t=>`<details class="sub tool ${t.isError?'err':''}" open>
+      <summary class=cardsum><span class=lbl><b>${esc(t.toolName)}</b><span class=dim>${off(t)}</span>${t.isError?'<span class=bad>error</span>':''}</span></summary>
       ${MODE==="raw"?cut(J(t.raw),hl):`
       ${t.args?`<details><summary>arguments</summary>${cut(t.args)}</details>`:""}
       <details><summary>result (${(t.blocks||[]).reduce((n,b)=>n+(b.text||"").length,0).toLocaleString()} chars)</summary>${cut((t.blocks||[]).map(b=>b.text).join("\n"))}</details>`}
-    </div>`).join("")}
-  </div>`;
+    </details>`).join("")}
+  </details>`;
 }
 
 function renderRun(r,d,opts){
@@ -821,6 +887,17 @@ document.addEventListener("keydown",e=>{
   if(t==="INPUT"||t==="SELECT"||t==="TEXTAREA")return;
   e.preventDefault(); setDetail(!detailHidden());
 });
+// Every card is its own <details>, so one button has to mean something sensible
+// for a mixed state: if anything is open, close everything; otherwise open it.
+const CARDS="details.ctx,details.call,details.ctxmsg,details.outsec,details.sub";
+$("#foldall").onclick=()=>{
+  const els=[...$("#detail").querySelectorAll(CARDS)];
+  if(!els.length)return;
+  const anyOpen=els.some(x=>x.open);
+  els.forEach(x=>x.open=!anyOpen);
+  $("#foldall").textContent=anyOpen?"unfold all":"fold all";
+};
+
 // ---------- staying up to date ----------
 // The server re-checks the trajectory files on a timer and gives its data a new
 // version label whenever one of them moved. We hold onto the last label we saw
@@ -869,8 +946,160 @@ $("#refresh").onclick=async()=>{
 setInterval(checkVersion,5000);
 checkVersion();
 
+// ---------- arriving from somewhere else ----------
+// /health links to #run=<id>. That run is usually not in the list on screen —
+// it may be older than the limit, or filtered out — so we don't hunt for a row
+// to click. open() only ever needs an id and something to mark selected, and a
+// stub supplies both.
+const stubRow=id=>({dataset:{id},classList:{add(){},remove(){}}});
+async function openHash(){
+  const m=/^#run=(.+)$/.exec(location.hash);
+  if(m)await open(stubRow(decodeURIComponent(m[1])));
+}
+addEventListener("hashchange",openHash);
+
 try{if(localStorage.getItem("hideDetail"))setDetail(true)}catch(e){}
 
+load().then(openHash);
+</script>"""
+
+
+# The colour tokens and base rules are repeated here rather than shared. The
+# alternative is a /style.css route, which would mean the trace page can render
+# unstyled if one request fails — not worth it for six lines.
+HEALTH_PAGE = r"""<!doctype html><meta charset=utf-8><title>OpenClaw Reliability</title>
+<style>
+:root{--bg:#fff;--fg:#111;--dim:#666;--line:#e3e3e3;--card:#fafafa;--accent:#2b6cb0;--bad:#c53030;--warn:#b7791f;--ok:#2f7d51}
+@media(prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e8e8e8;--dim:#9aa0a6;--line:#2c3036;--card:#1c1f23;--accent:#7aa7d9;--bad:#f28b82;--warn:#e0b95d;--ok:#7ec699}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+header{padding:10px 16px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center;flex-wrap:wrap;position:sticky;top:0;background:var(--bg);z-index:5}
+h1{font-size:14px;margin:0;font-weight:600}
+h2{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:26px 0 6px;font-weight:600}
+.stat{color:var(--dim);font-size:12px}
+.pill{display:inline-block;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:1px 7px;font-size:11px}
+.pill.act{border-color:var(--accent);color:var(--accent);font-weight:600}
+nav{display:flex;gap:6px}
+nav a.pill{text-decoration:none;color:var(--dim);font-size:13px;padding:5px 14px;border-radius:8px}
+nav a.pill:hover{border-color:var(--accent);color:var(--accent)}
+main{padding:16px 16px 60px;max-width:1180px}
+.cards{display:flex;gap:10px;flex-wrap:wrap}
+.card{border:1px solid var(--line);border-radius:10px;padding:11px 15px;background:var(--card);min-width:132px}
+.big{font-size:25px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.15}
+.cap{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--dim)}
+.sub{font-size:11px;color:var(--dim)}
+.note{color:var(--dim);font-size:12px;margin:4px 0 0;max-width:78ch}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-weight:600;font-size:11px;color:var(--dim);padding:6px 8px;border-bottom:1px solid var(--line);text-transform:uppercase;letter-spacing:.04em}
+td{padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
+.bad{color:var(--bad);font-weight:600}.dim{color:var(--dim)}.ok{color:var(--ok);font-weight:600}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.bar{display:inline-block;height:7px;border-radius:4px;background:var(--bad);vertical-align:middle;min-width:2px}
+.barwrap{width:150px}
+tr.run{cursor:pointer}tr.run:hover td{background:var(--card)}
+.msg{color:var(--dim);max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.empty{color:var(--dim);padding:40px;text-align:center}
+.offline{background:var(--bad);color:#fff;padding:6px 16px;font-size:12px;font-weight:600}
+.redbadge{background:var(--warn);color:#111;font-weight:700;padding:1px 6px;border-radius:4px;font-size:10px;letter-spacing:.06em}
+.two{display:flex;gap:26px;flex-wrap:wrap;align-items:flex-start}
+.two>section{flex:1 1 380px;min-width:340px}
+</style>
+<header>
+  <h1>OpenClaw Traces</h1>
+  <nav><a class=pill href="/">Traces</a><a class="pill act" href="/health">Reliability</a></nav>
+  <span class=stat id=stats></span>
+</header>
+<div id=offline class=offline hidden></div>
+<main id=main><div class=empty>loading…</div></main>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>(s??"").toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const dur=ms=>ms==null?"—":ms<1000?ms+"ms":ms<60000?(ms/1000).toFixed(1)+"s":Math.floor(ms/60000)+"m"+Math.round(ms%60000/1000)+"s";
+const when=t=>t?t.replace("T"," ").replace(/\..*/,""):"—";
+const pct=(a,b)=>b?(100*a/b).toFixed(1)+"%":"—";
+
+function render(d){
+  const bad=d.bad||0, tot=d.total||0;
+  const worst=Math.max(1,...d.kinds.map(k=>k.n));
+  const cards=`<div class=cards>
+    <div class=card><div class=cap>runs indexed</div><div class=big>${tot.toLocaleString()}</div></div>
+    <div class=card><div class=cap>finished ok</div><div class="big ok">${(d.ok||0).toLocaleString()}</div>
+      <div class=sub>${pct(d.ok||0,tot)} of all runs</div></div>
+    <div class=card><div class=cap>did not finish</div><div class="big bad">${bad.toLocaleString()}</div>
+      <div class=sub>${pct(bad,tot)} of all runs</div></div>
+    <div class=card><div class=cap>runs with a tool error</div><div class=big style="color:var(--warn)">${(d.tool_err_runs||0).toLocaleString()}</div>
+      <div class=sub>${(d.tool_err_total||0).toLocaleString()} errors, ${pct(d.tool_err_runs||0,tot)} of runs</div></div>
+  </div>
+  <p class=note><b>These are two different questions.</b> "Did not finish" means the run
+  ended badly — it was aborted, ran out of budget, or never completed. "Tool error" means
+  something failed <i>inside</i> a run that may well have ended fine: a denied command, a
+  missing file, an API refusing. A run can be in either column, both, or neither.</p>`;
+
+  const kinds=`<section><h2>Why runs did not finish</h2><table><thead>
+    <tr><th>reason</th><th class=num>runs</th><th></th></tr></thead><tbody>
+    ${d.kinds.map(k=>`<tr><td>${esc(k.kind)}</td><td class="num mono">${k.n}</td>
+      <td class=barwrap><span class=bar style="width:${Math.round(100*k.n/worst)}%"></span></td></tr>`).join("")
+      ||`<tr><td colspan=3 class=dim>none</td></tr>`}
+    </tbody></table></section>`;
+
+  const agents=`<section><h2>Per agent</h2><table><thead>
+    <tr><th>agent</th><th class=num>runs</th><th class=num>failed</th><th class=num>fail rate</th>
+    <th class=num>runs w/ tool error</th></tr></thead><tbody>
+    ${d.agents.map(a=>`<tr><td>${esc(a.agent)}</td>
+      <td class="num mono">${a.runs}</td>
+      <td class="num mono ${a.bad?"bad":"dim"}">${a.bad}</td>
+      <td class="num mono ${a.bad?"bad":"dim"}">${pct(a.bad,a.runs)}</td>
+      <td class="num mono ${a.tool_err?"":"dim"}" style="${a.tool_err?"color:var(--warn)":""}">${a.tool_err}</td></tr>`).join("")}
+    </tbody></table></section>`;
+
+  const runs=`<h2>Every run that did not finish${d.truncated?` <span class=dim>(newest ${d.bad_runs.length}, ${d.truncated} older not shown)</span>`:""}</h2>
+    <table><thead><tr><th>when</th><th>agent</th><th>reason</th><th>trigger</th>
+    <th>first message</th><th class=num>took</th><th class=num>tools</th><th class=num>tokens</th></tr></thead><tbody>
+    ${d.bad_runs.map(r=>`<tr class=run data-id="${esc(r.run_id)}" title="open this run in the trace view">
+      <td class="mono dim">${when(r.started_ts)}</td>
+      <td>${esc(r.agent)}</td>
+      <td class=bad>${esc(r.label||"failed")}</td>
+      <td class="mono dim">${esc(r.trigger||"—")}</td>
+      <td class=msg title="${esc(r.user_text)}">${esc(r.user_text)||'<span class=dim>—</span>'}</td>
+      <td class="num mono">${dur(r.duration_ms)}</td>
+      <td class="num mono">${r.tool_count||0}${r.error_tool_count?` <span class=bad>${r.error_tool_count}✕</span>`:""}</td>
+      <td class="num mono">${(r.total_tokens||0).toLocaleString()}</td></tr>`).join("")
+      ||`<tr><td colspan=8 class=dim>nothing failed — every indexed run finished</td></tr>`}
+    </tbody></table>`;
+
+  $("#main").innerHTML=cards+`<div class=two>${kinds}${agents}</div>`+runs;
+  $("#stats").innerHTML=(d.redact?`<span class=redbadge>REDACTED — placeholder content</span> `:"")
+    +esc(`${tot.toLocaleString()} runs · ${bad} did not finish · ${d.tool_err_runs} hit a tool error`);
+  // Straight into the existing trace view, which opens the run from the hash.
+  $("#main").querySelectorAll("tr.run").forEach(tr=>tr.onclick=()=>{
+    location.href="/#run="+encodeURIComponent(tr.dataset.id);
+  });
+}
+
+// A failed fetch used to look exactly like a quiet day: nothing changed on
+// screen. It says so now — a dead ssh tunnel is the usual cause.
+function offline(on,msg){
+  const el=$("#offline");
+  el.hidden=!on;
+  if(on)el.textContent="Disconnected — "+msg+". The server is not answering; check the ssh tunnel on port 8765.";
+}
+
+let DV=null;
+async function load(){
+  try{
+    const d=await (await fetch("/api/health")).json();
+    offline(false); render(d);
+  }catch(e){ offline(true,e.message||"fetch failed") }
+}
+async function poll(){
+  try{
+    const v=await (await fetch("/api/version")).json();
+    offline(false);
+    if(DV!==null&&v.v!==DV)await load();
+    DV=v.v;
+  }catch(e){ offline(true,e.message||"fetch failed") }
+}
+setInterval(poll,5000);
 load();
 </script>"""
 
