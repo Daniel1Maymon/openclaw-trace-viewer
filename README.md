@@ -130,7 +130,20 @@ Python 3.8+. Nothing else — no pip install, no `requirements.txt`.
 
 ## Usage
 
-Build the index (read-only on the source):
+The short way — preflight, index, refresh cron, start, and a `curl` that proves
+it is actually serving:
+
+```bash
+./install.sh
+```
+
+It is idempotent; running it again is how you upgrade. `./install.sh --help`
+lists the flags (`--dir`, `--port`, `--agents-dir`, `--no-cron`, `--no-start`).
+Handing the repo to a coding agent works too — `CLAUDE.md` tells it what to ask
+and what not to touch.
+
+The long way, if you would rather see each step. Build the index (read-only on
+the source):
 
 ```bash
 python3 index_traces.py

@@ -9,3 +9,7 @@ traces.db-*
 __pycache__/
 *.pyc
 .DS_Store
+
+# Written by install.sh at install time — it names this machine's paths.
+trace-viewer.env
+*.bak-*
