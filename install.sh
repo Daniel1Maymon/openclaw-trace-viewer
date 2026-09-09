@@ -144,7 +144,9 @@ say "settings written to $(basename "$ENVF")"
 step "building the index"
 cd "$DIR"
 set +e
-OPENCLAW_AGENTS_DIR="$AGENTS_DIR" ${SKIP:+TRACE_SKIP_AGENTS="$SKIP"} \
+# `env` and not a VAR=x prefix: a ${SKIP:+...} expansion is a word, not an
+# assignment, so the shell would try to run it as a command.
+env OPENCLAW_AGENTS_DIR="$AGENTS_DIR" ${SKIP:+TRACE_SKIP_AGENTS="$SKIP"} \
   python3 index_traces.py
 RC=$?
 set -e

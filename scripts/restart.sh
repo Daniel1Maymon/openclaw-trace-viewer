@@ -16,7 +16,9 @@ PORT="${TRACE_PORT:-8765}"
 LOG_DIR="${TRACE_LOG_DIR:-$DIR}"
 mkdir -p "$LOG_DIR"
 
-pkill -f "python3 $DIR/serve.py" 2>/dev/null || pkill -f 'python3 serve.py' 2>/dev/null || true
+# Match the absolute path only. A broad `pkill -f serve.py` will happily kill
+# somebody else's viewer on the same box — it did, once.
+pkill -f "python3 $DIR/serve.py" 2>/dev/null || true
 sleep 1
 
 setsid python3 "$DIR/serve.py" >> "$LOG_DIR/trace-viewer.log" 2>&1 </dev/null &
