@@ -605,6 +605,9 @@ tr.sessrow.open td{background:var(--card)}
 td.twist{width:16px;color:var(--dim);text-align:center;user-select:none;font-size:9px}
 tr.child td{background:color-mix(in srgb,var(--card) 60%,transparent);font-weight:400}
 tr.child td:first-child{border-left:3px solid var(--accent)}
+td.copysess{cursor:copy}td.copysess:hover{color:var(--accent)}
+#toast{position:fixed;background:var(--card);color:var(--fg);border:1px solid var(--accent);border-radius:6px;padding:6px 12px;font-size:12px;font-family:ui-monospace,Menlo,monospace;opacity:0;transition:opacity .2s;pointer-events:none;z-index:99}
+#toast.on{opacity:1}
 td.sess{cursor:pointer;font-size:11px}td.sess:hover{color:var(--accent);text-decoration:underline}
 .priorwrap{margin:0 0 12px;border:1px dashed var(--line);border-radius:8px;padding:6px 10px}
 .priorwrap>summary{color:var(--dim);font-size:12px}
@@ -706,6 +709,23 @@ details.outsec>summary.cardsum{margin:8px 0 3px}
 </main>
 <script>
 const $=s=>document.querySelector(s);
+// Shown at the pointer, where the eye already is — a corner toast went unnoticed.
+function toast(msg,x,y){
+  let t=$("#toast"); if(!t){t=document.createElement("div");t.id="toast";document.body.appendChild(t)}
+  t.textContent=msg; t.classList.add("on");
+  // Right of and below the cursor, flipped back inside the window near an edge.
+  const w=t.offsetWidth,h=t.offsetHeight;
+  t.style.left=Math.max(4,Math.min(x+14,innerWidth-w-8))+"px";
+  t.style.top=Math.max(4,Math.min(y+16,innerHeight-h-8))+"px";
+  clearTimeout(toast.h); toast.h=setTimeout(()=>t.classList.remove("on"),1800);
+}
+// navigator.clipboard needs a secure context; localhost over the ssh tunnel is
+// one, but fall back to execCommand so a plain-IP URL still works.
+async function copyText(s,x,y){
+  try{await navigator.clipboard.writeText(s)}
+  catch(_){const a=document.createElement("textarea");a.value=s;document.body.appendChild(a);a.select();document.execCommand("copy");a.remove()}
+  toast("copied session id "+s,x,y);
+}
 
 // Collapse the trace pane. Persisted, because whoever wants the wide list
 // usually wants it on the next page load too.
@@ -847,7 +867,7 @@ async function load(){
       <td class=twist>${g.turns>1?"▶":""}</td>
       <td class="mono dim">${when(g.last_ts)}</td>
       <td>${esc(g.agent)}${g.failed?` <span class=bad>✕${g.failed>1?" "+g.failed:""}</span>`:""}${!g.failed&&g.tool_err?` <span class=quiet title="every turn finished ok, but ${g.tool_err} tool calls failed inside them">${g.tool_err}✕ tools</span>`:""}</td>
-      <td class="mono dim">${g.session_id.slice(0,8)}<br><span class=dim>${esc(g.trigger||"")}</span></td>
+      <td class="mono dim copysess" data-sess="${g.session_id}" title="click to copy the full session id">${g.session_id.slice(0,8)}<br><span class=dim>${esc(g.trigger||"")}</span></td>
       <td class=msg title="${esc(g.user_text)}">${esc(g.user_text)||'<span class=dim>—</span>'}</td>
       <td class=mono><span class=tracebtn data-sess="${g.session_id}" title="open the whole session as one trace">▶ ${g.turns}</span></td>
       <td class=mono>${dur(g.duration_ms)}</td>
@@ -871,6 +891,11 @@ async function load(){
   $("#list").querySelectorAll(".tracebtn").forEach(el=>el.onclick=e=>{
     e.stopPropagation();
     openSession(el.dataset.sess);
+  });
+  // Copy, not open: the cell only shows 8 chars, and the full id is what you
+  // paste into grep or a journalctl filter on the box.
+  $("#list").querySelectorAll("td.copysess").forEach(td=>td.onclick=e=>{
+    e.stopPropagation(); copyText(td.dataset.sess,e.clientX,e.clientY);
   });
   $("#list").querySelectorAll("td.sess").forEach(td=>td.onclick=e=>{
     e.stopPropagation(); $("#q").value=td.dataset.sess; $("#grp").value="run"; load();
